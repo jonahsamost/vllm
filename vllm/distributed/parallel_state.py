@@ -743,6 +743,9 @@ class GroupCoordinator:
             return self._all_reduce_out_place(input_)
 
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
+        from vllm.v1.worker.simfer_capture import record_collective
+
+        record_collective("all_reduce", self, input_)
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_)
@@ -764,6 +767,9 @@ class GroupCoordinator:
             return self._all_gather_out_place(input_, dim)
 
     def _all_gather_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
+        from vllm.v1.worker.simfer_capture import record_collective
+
+        record_collective("all_gather", self, input_, dimension=dim)
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gather(input_, dim)
@@ -774,6 +780,9 @@ class GroupCoordinator:
         dim: int = 0,
         sizes: list[int] | None = None,
     ):
+        from vllm.v1.worker.simfer_capture import record_collective
+
+        record_collective("all_gatherv", self, input_, dimension=dim, sizes=sizes)
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gatherv(input_, dim, sizes)
@@ -797,11 +806,19 @@ class GroupCoordinator:
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ) -> torch.Tensor:
+        from vllm.v1.worker.simfer_capture import record_collective
+
+        record_collective(
+            "reduce_scatterv", self, input_, dimension=dim, sizes=sizes
+        )
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.reduce_scatterv(input_, dim, sizes)
 
     def _reduce_scatter_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
+        from vllm.v1.worker.simfer_capture import record_collective
+
+        record_collective("reduce_scatter", self, input_, dimension=dim)
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.reduce_scatter(input_, dim)
@@ -1402,6 +1419,13 @@ class GroupCoordinator:
         tuple[torch.Tensor, torch.Tensor]
         | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
     ):
+        from vllm.v1.worker.simfer_capture import record_collective
+
+        record_collective(
+            "dispatch_router_logits",
+            self,
+            (hidden_states, router_logits, extra_tensors),
+        )
         if self.device_communicator is not None:
             return self.device_communicator.dispatch_router_logits(
                 hidden_states,
@@ -1423,6 +1447,13 @@ class GroupCoordinator:
         tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ):
+        from vllm.v1.worker.simfer_capture import record_collective
+
+        record_collective(
+            "moe_dispatch",
+            self,
+            (hidden_states, topk_weights, topk_ids, extra_tensors),
+        )
         if self.device_communicator is not None:
             return self.device_communicator.dispatch(
                 hidden_states,
@@ -1437,6 +1468,9 @@ class GroupCoordinator:
     def combine(
         self, hidden_states, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
+        from vllm.v1.worker.simfer_capture import record_collective
+
+        record_collective("moe_combine", self, hidden_states)
         if self.device_communicator is not None:
             return self.device_communicator.combine(hidden_states, is_sequence_parallel)
         else:

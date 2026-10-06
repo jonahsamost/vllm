@@ -4267,6 +4267,16 @@ class GPUModelRunner(
                 should_ubatch,
                 num_tokens_across_dp,
             )
+            from vllm.v1.worker.simfer_capture import record_runtime_dispatch
+
+            record_runtime_dispatch(
+                scheduler_output,
+                cudagraph_mode,
+                batch_desc,
+                num_requests=num_reqs,
+                should_ubatch=should_ubatch,
+                num_tokens_across_dp=num_tokens_across_dp,
+            )
 
             num_tokens_padded = batch_desc.num_tokens
             num_reqs_padded = (
@@ -5356,6 +5366,9 @@ class GPUModelRunner(
             format_gib(self.model_memory_usage),
             time_after_load - time_before_load,
         )
+        from vllm.v1.worker.simfer_capture import record_model_memory
+
+        record_model_memory(self.model, self.model_memory_usage)
 
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
@@ -7393,6 +7406,15 @@ class GPUModelRunner(
             kv_transfer_group = get_kv_transfer_group()
             kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+
+        if not is_profiling:
+            from vllm.v1.worker.simfer_capture import (
+                record_backend_selection,
+                record_kv_memory,
+            )
+
+            record_kv_memory(self.kv_caches, kv_cache_config)
+            record_backend_selection(self)
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """Add encoder-only layers to the KV cache config."""

@@ -270,6 +270,13 @@ class CompilerManager:
         num_graphs: int = 1,
         is_encoder: bool = False,
     ) -> Any:
+        from vllm.v1.worker.simfer_capture import record_fx_graph
+
+        record_fx_graph(
+            graph,
+            graph_index=graph_index,
+            compile_range=compile_range,
+        )
         if graph_index == 0:
             # before compiling the first graph, record the start time
             global compilation_start_time
