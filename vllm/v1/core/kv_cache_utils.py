@@ -1425,7 +1425,12 @@ def unify_kv_cache_spec_page_size(
                     "maximum page size and cannot be padded. Padding is only "
                     "supported for non-MLA attention layers."
                 )
-            assert new_spec.page_size_bytes == max_page_size
+            if new_spec.page_size_bytes != max_page_size:
+                raise NotImplementedError(
+                    f"Layer {layer_name}: scaling block_size cannot produce "
+                    f"the common {max_page_size}-byte page because the "
+                    "specification applies its own page alignment"
+                )
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
 

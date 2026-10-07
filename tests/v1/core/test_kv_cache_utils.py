@@ -3743,6 +3743,40 @@ def test_unify_kv_cache_page_size_uses_padding_for_non_divisible_sizes():
     assert unified_draft_spec.page_size_bytes == target_spec.page_size_bytes
 
 
+def test_unify_aligned_mla_page_size_reports_unsupported_scaling():
+    """An aligned state record need not scale linearly with block size.
+
+    Here the 19,008-byte page divides the 38,016-byte maximum exactly, but
+    doubling its block size produces 37,440 bytes because each page applies
+    its own 576-byte alignment. The caller's documented fallback needs a
+    NotImplementedError rather than an internal assertion failure.
+    """
+    common = {
+        "num_kv_heads": 1,
+        "head_size": 1,
+        "dtype": torch.uint8,
+        "cache_dtype_str": "fp8_ds_mla",
+        "state_content_bytes": 584,
+        "alignment": 576,
+    }
+    smaller = SlidingWindowMLASpec(
+        block_size=32,
+        sliding_window=128,
+        **common,
+    )
+    larger = MLAAttentionSpec(block_size=65, **common)
+    assert larger.page_size_bytes == 2 * smaller.page_size_bytes
+    assert (
+        replace(smaller, block_size=64).page_size_bytes
+        != larger.page_size_bytes
+    )
+
+    with pytest.raises(NotImplementedError, match="applies its own page alignment"):
+        kv_cache_utils.unify_kv_cache_spec_page_size(
+            {"smaller": smaller, "larger": larger}
+        )
+
+
 def test_unpadded_page_size_includes_per_token_head_scales():
     # Per-token-head quant carries inline fp32 scales that are carved from the
     # raw KV allocation, so they must be budgeted into the offload width. The
