@@ -1,10 +1,17 @@
 import json
+import base64
+from contextlib import contextmanager
+from pathlib import Path
 
 import torch
+import vllm.v1.worker.simfer_capture as simfer_capture
 
 from vllm.v1.worker.simfer_capture import (
+    capture_step,
+    record_event,
     record_fx_graph,
     record_model_memory,
+    record_phase,
 )
 
 
@@ -16,6 +23,23 @@ class TiedModel(torch.nn.Module):
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return value @ self.weight
+
+
+def test_capture_uses_initialized_distributed_rank(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_ID", "capture-rank")
+    monkeypatch.setenv("VLLM_SIMFER_VLLM_COMMIT", "a" * 40)
+    monkeypatch.setenv("VLLM_SIMFER_MODEL_CONFIG_SHA256", "b" * 64)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 3)
+
+    record_event("rank_probe")
+
+    event = json.loads((tmp_path / "rank-3.jsonl").read_text())
+    assert event["rank"] == 3
+    assert event["kind"] == "rank_probe"
 
 
 def test_capture_deduplicates_storage_and_records_fx_graph(
@@ -48,3 +72,148 @@ def test_capture_deduplicates_storage_and_records_fx_graph(
     assert graph["kind"] == "fx_graph"
     assert graph["payload"]["compile_range"] == {"start": 1, "end": 8}
     assert any(node["op"] == "call_function" for node in graph["payload"]["nodes"])
+
+
+def test_capture_records_correlated_host_boundaries(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_ID", "capture-2")
+    monkeypatch.setenv("VLLM_SIMFER_VLLM_COMMIT", "a" * 40)
+    monkeypatch.setenv("VLLM_SIMFER_MODEL_CONFIG_SHA256", "b" * 64)
+    markers = []
+
+    @contextmanager
+    def record_function(name):
+        markers.append(name)
+        yield
+
+    monkeypatch.setattr(torch.profiler, "record_function", record_function)
+
+    class SchedulerOutput:
+        total_num_scheduled_tokens = 4
+
+    @capture_step
+    def execute(_self, _scheduler_output):
+        with record_phase("model_forward"):
+            return "done"
+
+    assert execute(None, SchedulerOutput()) == "done"
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "rank-0.jsonl").read_text().splitlines()
+    ]
+
+    assert [event["kind"] for event in events] == [
+        "step_start",
+        "phase_start",
+        "phase_end",
+        "step_end",
+    ]
+    assert all(event["schema_version"] == 2 for event in events)
+    assert events[0]["correlation_id"] == events[-1]["correlation_id"]
+    assert events[1]["parent_correlation_id"] == events[0]["correlation_id"]
+    assert [event["timestamp_ns"] for event in events] == sorted(
+        event["timestamp_ns"] for event in events
+    )
+    assert events[-1]["payload"]["device_completion_observed"] is False
+    assert len(markers) == 2
+    marker_payloads = [
+        json.loads(
+            base64.urlsafe_b64decode(
+                name.removeprefix("simfer:v1:")
+                + "=" * (-len(name.removeprefix("simfer:v1:")) % 4)
+            )
+        )
+        for name in markers
+    ]
+    assert marker_payloads[0]["name"] == "worker_step"
+    assert marker_payloads[1]["name"] == "model_forward"
+    assert marker_payloads[1]["parent_correlation_id"] == events[0]["correlation_id"]
+
+
+def test_capture_profiles_only_selected_step_and_observes_device_completion(
+    tmp_path, monkeypatch
+) -> None:
+    capture = tmp_path / "capture"
+    traces = tmp_path / "traces"
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(capture))
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_ID", "capture-profile")
+    monkeypatch.setenv("VLLM_SIMFER_VLLM_COMMIT", "a" * 40)
+    monkeypatch.setenv("VLLM_SIMFER_MODEL_CONFIG_SHA256", "b" * 64)
+    monkeypatch.setenv("VLLM_SIMFER_PROFILE_DIR", str(traces))
+    monkeypatch.setenv("VLLM_SIMFER_PROFILE_TOKEN_COUNTS", "8")
+    monkeypatch.setenv("VLLM_SIMFER_PROFILE_MAX_STEPS", "1")
+    monkeypatch.setattr(simfer_capture, "_PROFILED_STEPS", 0)
+    monkeypatch.setattr(simfer_capture, "_PROFILE_MATCHES", 0)
+    synchronized = []
+
+    class FakeProfiler:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def export_chrome_trace(self, path):
+            Path(path).write_text('{"traceEvents": []}')
+
+    monkeypatch.setattr(torch.profiler, "profile", lambda **_kwargs: FakeProfiler())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: synchronized.append(True))
+
+    class SchedulerOutput:
+        total_num_scheduled_tokens = 8
+
+    @capture_step
+    def execute(_self, _scheduler_output):
+        return "done"
+
+    assert execute(None, SchedulerOutput()) == "done"
+    events = [
+        json.loads(line)
+        for line in (capture / "rank-0.jsonl").read_text().splitlines()
+    ]
+
+    assert synchronized == [True]
+    assert [event["kind"] for event in events] == [
+        "step_start",
+        "profiler_artifact",
+        "step_end",
+    ]
+    assert events[-1]["payload"]["device_completion_observed"] is True
+    assert len(tuple(traces.glob("rank-0-step-*.pt.trace.json"))) == 1
+
+
+def test_capture_can_skip_matching_warmup_step(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(tmp_path / "capture"))
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_ID", "capture-warmup")
+    monkeypatch.setenv("VLLM_SIMFER_VLLM_COMMIT", "a" * 40)
+    monkeypatch.setenv("VLLM_SIMFER_MODEL_CONFIG_SHA256", "b" * 64)
+    monkeypatch.setenv("VLLM_SIMFER_PROFILE_DIR", str(tmp_path / "traces"))
+    monkeypatch.setenv("VLLM_SIMFER_PROFILE_TOKEN_COUNTS", "8")
+    monkeypatch.setenv("VLLM_SIMFER_PROFILE_SKIP_MATCHES", "1")
+    monkeypatch.setattr(simfer_capture, "_PROFILED_STEPS", 0)
+    monkeypatch.setattr(simfer_capture, "_PROFILE_MATCHES", 0)
+
+    class FakeProfiler:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def export_chrome_trace(self, path):
+            Path(path).write_text('{"traceEvents": []}')
+
+    monkeypatch.setattr(torch.profiler, "profile", lambda **_kwargs: FakeProfiler())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    class SchedulerOutput:
+        total_num_scheduled_tokens = 8
+
+    @capture_step
+    def execute(_self, _scheduler_output):
+        return "done"
+
+    execute(None, SchedulerOutput())
+    execute(None, SchedulerOutput())
+
+    assert len(tuple((tmp_path / "traces").glob("*.pt.trace.json"))) == 1

@@ -16,6 +16,7 @@ from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
 from vllm.model_executor.model_loader.weight_utils import (
     initialize_single_dummy_weight,
 )
+from vllm.v1.worker.simfer_synthetic import validate_dummy_loader
 
 
 class DummyModelLoader(BaseModelLoader):
@@ -23,6 +24,7 @@ class DummyModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
+        validate_dummy_loader(load_config.load_format)
         if load_config.model_loader_extra_config:
             raise ValueError(
                 f"Model loader extra config is not supported for "

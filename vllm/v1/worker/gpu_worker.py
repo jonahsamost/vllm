@@ -89,6 +89,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
+from vllm.v1.worker import simfer_capture
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -1177,6 +1178,7 @@ class Worker(WorkerBase):
         return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
+    @simfer_capture.capture_step
     @with_gpu_sync_check
     def execute_model(
         self, scheduler_output: "SchedulerOutput"

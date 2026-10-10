@@ -201,7 +201,7 @@ from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
-from vllm.v1.worker import mamba_utils
+from vllm.v1.worker import mamba_utils, simfer_capture
 from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
@@ -4182,6 +4182,7 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
+            simfer_capture.record_phase("preprocess"),
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
@@ -4267,9 +4268,7 @@ class GPUModelRunner(
                 should_ubatch,
                 num_tokens_across_dp,
             )
-            from vllm.v1.worker.simfer_capture import record_runtime_dispatch
-
-            record_runtime_dispatch(
+            simfer_capture.record_runtime_dispatch(
                 scheduler_output,
                 cudagraph_mode,
                 batch_desc,
@@ -4429,6 +4428,7 @@ class GPUModelRunner(
                 is_padding=is_padding,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
+            simfer_capture.record_phase("model_forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
@@ -4442,7 +4442,10 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
-        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+        with (
+            record_function_or_nullcontext("gpu_model_runner: postprocess"),
+            simfer_capture.record_phase("postprocess"),
+        ):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
@@ -4572,7 +4575,10 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
+        with (
+            record_function_or_nullcontext("gpu_model_runner: sample"),
+            simfer_capture.record_phase("sampling"),
+        ):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._update_states_after_model_execute(
@@ -4597,7 +4603,10 @@ class GPUModelRunner(
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
-            with record_function_or_nullcontext("gpu_model_runner: draft"):
+            with (
+                record_function_or_nullcontext("gpu_model_runner: draft"),
+                simfer_capture.record_phase("speculative_draft"),
+            ):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
@@ -4700,7 +4709,10 @@ class GPUModelRunner(
                 self._draft_prob_req_ids = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
-        with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+        with (
+            record_function_or_nullcontext("gpu_model_runner: bookkeep"),
+            simfer_capture.record_phase("bookkeeping"),
+        ):
             (
                 num_nans_in_logits,
                 num_nans_device,
@@ -4744,14 +4756,20 @@ class GPUModelRunner(
         if spec_config is not None:
             self.finalize_kv_connector()
 
-        with record_function_or_nullcontext("gpu_model_runner: eplb"):
+        with (
+            record_function_or_nullcontext("gpu_model_runner: eplb"),
+            simfer_capture.record_phase("eplb"),
+        ):
             self.eplb_step()
 
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
-        with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
+        with (
+            record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"),
+            simfer_capture.record_phase("output_assembly"),
+        ):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,

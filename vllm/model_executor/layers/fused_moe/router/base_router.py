@@ -12,6 +12,7 @@ from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+from vllm.v1.worker.simfer_synthetic import override_moe_routing
 
 if current_platform.is_cuda_alike() or current_platform.is_xpu():
 
@@ -291,6 +292,11 @@ class BaseRouter(FusedMoERouter):
         topk_weights, topk_ids = self._compute_routing(
             hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
         )
+        exact_routing = override_moe_routing(
+            topk_weights, topk_ids, self.global_num_experts
+        )
+        if exact_routing is not None:
+            topk_weights, topk_ids = exact_routing
 
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:

@@ -80,6 +80,7 @@ from vllm.v1.watermarking.spec_decode import (
     create_speculative_target_watermarker,
     speculative_target_watermark_key,
 )
+from vllm.v1.worker import simfer_capture
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
@@ -1705,6 +1706,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ),
             uniform_decode=uniform_tok_count == self.decode_query_len,
         )
+        simfer_capture.record_runtime_dispatch(
+            scheduler_output,
+            batch_desc.cg_mode,
+            batch_desc,
+            num_requests=num_reqs,
+            should_ubatch=batch_desc.num_ubatches > 1,
+            num_tokens_across_dp=(
+                dp_sync.num_tokens_across_dp if dp_sync is not None else None
+            ),
+        )
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
@@ -1916,7 +1927,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.pre_forward(
                 **connector_kwargs, attn_metadata=attn_metadata
             )
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            with simfer_capture.record_phase("model_forward", resource="gpu"):
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -1942,20 +1954,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_connector.pre_forward(**connector_kwargs)
                 if ubatch_state is not None:
                     assert self.ubatch_runner is not None
-                    model_output = self.ubatch_runner.run(
-                        self.model, model_inputs, ubatch_state
-                    )
+                    with simfer_capture.record_phase(
+                        "model_forward", resource="gpu"
+                    ):
+                        model_output = self.ubatch_runner.run(
+                            self.model, model_inputs, ubatch_state
+                        )
                 elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
                     # Run the PIECEWISE graph (compiled PW cudagraph or breakable
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
                     # PIECEWISE after the cudagraph manager exists.
                     assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
-                    )
+                    with simfer_capture.record_phase(
+                        "model_forward", resource="gpu"
+                    ):
+                        model_output = self.cudagraph_manager.run_pw_graph(
+                            self.model, model_inputs
+                        )
                 else:
                     # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+                    with simfer_capture.record_phase(
+                        "model_forward", resource="gpu"
+                    ):
+                        model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
 
@@ -2048,9 +2069,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for states in aux_hidden_states
             ]
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+        with simfer_capture.record_phase("sampling", resource="gpu"):
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2119,13 +2141,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
-        self.postprocess_sampled(
-            input_batch.idx_mapping,
-            sampler_output.sampled_token_ids,
-            num_sampled,
-            num_rejected,
-            input_batch.query_start_loc,
-        )
+        with simfer_capture.record_phase("bookkeeping"):
+            self.postprocess_sampled(
+                input_batch.idx_mapping,
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch.query_start_loc,
+            )
 
         if self.speculator is not None:
             assert self.sampler is not None
@@ -2146,22 +2169,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler._get_contexts(input_batch.idx_mapping),
                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
                 )
-            with use_workspace_lane(self._draft_workspace_lane):
-                draft_tokens = self.speculator.propose(
-                    input_batch,
-                    attn_metadata,
-                    slot_mappings_by_layer,
-                    spec_hidden_states,
-                    aux_hidden_states,
-                    num_sampled,
-                    num_rejected,
-                    self.req_states.last_sampled_tokens,
-                    self.req_states.next_prefill_tokens,
-                    self.sampler.sampling_states.temperature.gpu,
-                    self.sampler.sampling_states.seeds.gpu,
-                    dp_sync=dp_sync,
-                    mm_inputs=mm_inputs,
-                )
+            with simfer_capture.record_phase(
+                "speculative_draft", resource="gpu"
+            ):
+                with use_workspace_lane(self._draft_workspace_lane):
+                    draft_tokens = self.speculator.propose(
+                        input_batch,
+                        attn_metadata,
+                        slot_mappings_by_layer,
+                        spec_hidden_states,
+                        aux_hidden_states,
+                        num_sampled,
+                        num_rejected,
+                        self.req_states.last_sampled_tokens,
+                        self.req_states.next_prefill_tokens,
+                        self.sampler.sampling_states.temperature.gpu,
+                        self.sampler.sampling_states.seeds.gpu,
+                        dp_sync=dp_sync,
+                        mm_inputs=mm_inputs,
+                    )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(

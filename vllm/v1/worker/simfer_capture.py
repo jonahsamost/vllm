@@ -1,27 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in structural evidence for SimFer differential conformance.
+"""Opt-in structural and composition evidence for SimFer conformance.
 
-This module deliberately records metadata only. It does not synchronize a
-device, time kernels, install module hooks, retain tensors, or alter dispatch.
+This module does not synchronize a device, time kernels, retain tensors, or
+alter dispatch. Host timestamps describe enqueue/lifecycle boundaries only;
+device-completion timing must come from a correlated profiler capture.
 Set ``VLLM_SIMFER_CAPTURE_DIR`` to emit one JSONL stream per worker rank.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import threading
+import time
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, is_dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
 import torch
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _LOCK = threading.Lock()
-_EVENT_INDEX = 0
+_EVENT_INDICES: dict[Path, int] = {}
+_CORRELATION_INDEX = 0
+_NEXT_STEP = 0
+_PROFILED_STEPS = 0
+_PROFILE_MATCHES = 0
 _ACTIVE_STEP: int | None = None
+_ACTIVE_STEP_CORRELATION: str | None = None
+_ACTIVE_PHASE = threading.local()
 _INITIALIZED_STREAMS: set[Path] = set()
 _PROVENANCE_ENV = {
     "capture_id": "VLLM_SIMFER_CAPTURE_ID",
@@ -34,17 +45,20 @@ def enabled() -> bool:
     return bool(os.environ.get("VLLM_SIMFER_CAPTURE_DIR"))
 
 
-def record_event(kind: str, **payload: Any) -> None:
+def record_event(
+    kind: str,
+    *,
+    correlation_id: str | None = None,
+    parent_correlation_id: str | None = None,
+    **payload: Any,
+) -> None:
     if not enabled():
         return
     if not kind:
         raise ValueError("SimFer capture event kind cannot be empty")
     provenance = _capture_provenance()
-    global _EVENT_INDEX
-    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    rank = _rank()
     with _LOCK:
-        event_index = _EVENT_INDEX
-        _EVENT_INDEX += 1
         path = Path(os.environ["VLLM_SIMFER_CAPTURE_DIR"])
         path.mkdir(parents=True, exist_ok=True)
         stream = path / f"rank-{rank}.jsonl"
@@ -54,6 +68,8 @@ def record_event(kind: str, **payload: Any) -> None:
                     f"SimFer capture stream already exists and is not empty: {stream}"
                 )
             _INITIALIZED_STREAMS.add(stream)
+        event_index = _EVENT_INDICES.get(stream, 0)
+        _EVENT_INDICES[stream] = event_index + 1
         event = {
             "schema_version": _SCHEMA_VERSION,
             **provenance,
@@ -61,6 +77,11 @@ def record_event(kind: str, **payload: Any) -> None:
             "kind": kind,
             "rank": rank,
             "step_index": _ACTIVE_STEP,
+            "timestamp_ns": time.monotonic_ns(),
+            "process_id": os.getpid(),
+            "thread_id": threading.get_ident(),
+            "correlation_id": correlation_id,
+            "parent_correlation_id": parent_correlation_id,
             "payload": _jsonable(payload),
         }
         with stream.open("a") as output:
@@ -78,10 +99,9 @@ def record_runtime_dispatch(
 ) -> None:
     if not enabled():
         return
-    global _ACTIVE_STEP
-    _ACTIVE_STEP = 0 if _ACTIVE_STEP is None else _ACTIVE_STEP + 1
     record_event(
         "runtime_dispatch",
+        correlation_id=_ACTIVE_STEP_CORRELATION,
         request_ids=tuple(scheduler_output.num_scheduled_tokens),
         scheduled_tokens=tuple(scheduler_output.num_scheduled_tokens.items()),
         actual_num_tokens=scheduler_output.total_num_scheduled_tokens,
@@ -91,6 +111,221 @@ def record_runtime_dispatch(
         should_ubatch=should_ubatch,
         num_tokens_across_dp=num_tokens_across_dp,
     )
+
+
+def capture_step(function: Any) -> Any:
+    """Record one worker API span without forcing device synchronization."""
+
+    @wraps(function)
+    def wrapped(self: Any, scheduler_output: Any, *args: Any, **kwargs: Any) -> Any:
+        if not enabled():
+            return function(self, scheduler_output, *args, **kwargs)
+        correlation = _begin_step(scheduler_output)
+        outcome = "completed"
+        profile_path = _claim_profile_path(scheduler_output)
+        try:
+            if profile_path is None:
+                with _profiler_marker("worker_step", correlation, None):
+                    return function(self, scheduler_output, *args, **kwargs)
+            with torch.profiler.profile(
+                activities=(
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ),
+                record_shapes=True,
+                profile_memory=False,
+                with_stack=False,
+            ) as profiler:
+                with _profiler_marker("worker_step", correlation, None):
+                    result = function(self, scheduler_output, *args, **kwargs)
+                    # Profiling mode intentionally observes device completion.
+                    # Keep the sync correlated to the worker step; profiler
+                    # setup/teardown synchronization remains tool overhead.
+                    torch.cuda.synchronize()
+            profiler.export_chrome_trace(str(profile_path))
+            record_event(
+                "profiler_artifact",
+                correlation_id=correlation,
+                tool="pytorch-profiler",
+                path=profile_path.name,
+                schema="kineto-chrome-trace",
+            )
+            return result
+        except BaseException:
+            outcome = "error"
+            raise
+        finally:
+            _end_step(
+                correlation,
+                outcome,
+                device_completion_observed=profile_path is not None,
+            )
+
+    return wrapped
+
+
+@contextmanager
+def record_phase(name: str, *, resource: str = "host", **metadata: Any) -> Any:
+    """Record a nested host phase suitable for profiler correlation."""
+
+    if not enabled():
+        yield None
+        return
+    correlation = _new_correlation_id("phase")
+    parent = getattr(_ACTIVE_PHASE, "correlation", None)
+    if parent is None:
+        parent = _ACTIVE_STEP_CORRELATION
+    previous = getattr(_ACTIVE_PHASE, "correlation", None)
+    _ACTIVE_PHASE.correlation = correlation
+    record_event(
+        "phase_start",
+        correlation_id=correlation,
+        parent_correlation_id=parent,
+        name=name,
+        resource=resource,
+        **metadata,
+    )
+    try:
+        with _profiler_marker(name, correlation, parent):
+            yield correlation
+    finally:
+        record_event(
+            "phase_end",
+            correlation_id=correlation,
+            parent_correlation_id=parent,
+            name=name,
+            resource=resource,
+        )
+        _ACTIVE_PHASE.correlation = previous
+
+
+def _begin_step(scheduler_output: Any) -> str:
+    global _ACTIVE_STEP, _ACTIVE_STEP_CORRELATION, _NEXT_STEP
+    with _LOCK:
+        step = _NEXT_STEP
+        _NEXT_STEP += 1
+    _ACTIVE_STEP = step
+    correlation = _new_correlation_id("step")
+    _ACTIVE_STEP_CORRELATION = correlation
+    record_event(
+        "step_start",
+        correlation_id=correlation,
+        total_num_scheduled_tokens=getattr(
+            scheduler_output, "total_num_scheduled_tokens", None
+        ),
+        boundary="host_api_entry",
+    )
+    return correlation
+
+
+def _end_step(
+    correlation: str,
+    outcome: str,
+    *,
+    device_completion_observed: bool = False,
+) -> None:
+    global _ACTIVE_STEP, _ACTIVE_STEP_CORRELATION
+    record_event(
+        "step_end",
+        correlation_id=correlation,
+        outcome=outcome,
+        boundary="host_api_return",
+        device_completion_observed=device_completion_observed,
+    )
+    _ACTIVE_STEP = None
+    _ACTIVE_STEP_CORRELATION = None
+
+
+def _claim_profile_path(scheduler_output: Any) -> Path | None:
+    """Select a bounded set of exact scheduler steps for device profiling."""
+
+    global _PROFILED_STEPS, _PROFILE_MATCHES
+    root_value = os.environ.get("VLLM_SIMFER_PROFILE_DIR")
+    if not root_value:
+        return None
+    raw_counts = os.environ.get("VLLM_SIMFER_PROFILE_TOKEN_COUNTS", "")
+    try:
+        token_counts = {
+            int(value.strip()) for value in raw_counts.split(",") if value.strip()
+        }
+        maximum = int(os.environ.get("VLLM_SIMFER_PROFILE_MAX_STEPS", "1"))
+        skip_matches = int(
+            os.environ.get("VLLM_SIMFER_PROFILE_SKIP_MATCHES", "0")
+        )
+    except ValueError as error:
+        raise ValueError("invalid SimFer profiler step selection") from error
+    if not token_counts:
+        raise ValueError("VLLM_SIMFER_PROFILE_TOKEN_COUNTS cannot be empty")
+    if (
+        any(value < 0 for value in token_counts)
+        or maximum <= 0
+        or skip_matches < 0
+    ):
+        raise ValueError(
+            "SimFer profiler token counts must be nonnegative; maximum must "
+            "be positive"
+        )
+    scheduled = getattr(scheduler_output, "total_num_scheduled_tokens", None)
+    with _LOCK:
+        if scheduled not in token_counts:
+            return None
+        _PROFILE_MATCHES += 1
+        if _PROFILE_MATCHES <= skip_matches or _PROFILED_STEPS >= maximum:
+            return None
+        _PROFILED_STEPS += 1
+    root = Path(root_value)
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"rank-{_rank()}-step-{_ACTIVE_STEP}.pt.trace.json"
+
+
+def _rank() -> int:
+    """Resolve ranks created internally by vLLM as well as torchrun ranks."""
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+
+
+def _new_correlation_id(kind: str) -> str:
+    global _CORRELATION_INDEX
+    rank = _rank()
+    with _LOCK:
+        index = _CORRELATION_INDEX
+        _CORRELATION_INDEX += 1
+    return f"rank-{rank}:{kind}-{index}"
+
+
+@contextmanager
+def _profiler_marker(
+    name: str,
+    correlation_id: str,
+    parent_correlation_id: str | None,
+) -> Any:
+    mode = os.environ.get("VLLM_SIMFER_CAPTURE_MARKERS", "torch").lower()
+    if mode not in {"none", "torch", "nvtx", "both"}:
+        raise ValueError(
+            "VLLM_SIMFER_CAPTURE_MARKERS must be none, torch, nvtx, or both"
+        )
+    rank = _rank()
+    payload = json.dumps(
+        {
+            "correlation_id": correlation_id,
+            "name": name,
+            "parent_correlation_id": parent_correlation_id,
+            "rank": rank,
+            "step_index": _ACTIVE_STEP,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    marker = "simfer:v1:" + encoded
+    with ExitStack() as stack:
+        if mode in {"torch", "both"}:
+            stack.enter_context(torch.profiler.record_function(marker))
+        if mode in {"nvtx", "both"}:
+            stack.enter_context(torch.cuda.nvtx.range(marker))
+        yield
 
 
 def record_fx_graph(

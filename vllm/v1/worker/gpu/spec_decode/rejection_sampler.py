@@ -24,6 +24,7 @@ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
+from vllm.v1.worker.simfer_synthetic import override_speculative_acceptance
 
 # Cap on the FP32 target-logits buffer materialized by apply_sampling_params.
 # TODO(mgoin): Chunking is a workaround. The rejection kernels already upcast
@@ -313,6 +314,14 @@ class RejectionSampler:
             chunk_logit_limit,
             max_num_logprobs,
         )
+        exact_acceptance = override_speculative_acceptance(
+            sampled=sampled,
+            draft_sampled=draft_sampled,
+            cu_num_logits=input_batch.cu_num_logits_np,
+            has_logprobs=logprobs_tensors is not None,
+        )
+        if exact_acceptance is not None:
+            sampled, num_sampled = exact_acceptance
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,
