@@ -3,8 +3,8 @@
 """Build DeepGEMM's `_C` pybind11 extension for <TARGET_PY>.
 
 Driven from cmake/external_projects/deepgemm.cmake. The driver runs against
-the build interpreter's torch; <TARGET_PY> is only consulted for INCLUDEPY
-and SOABI, so target venvs don't need torch installed.
+the build interpreter's torch; <TARGET_PY> is only consulted for its Python
+headers and SOABI, so target venvs don't need torch installed.
 
 Usage: python build_deepgemm_C.py <DEEPGEMM_SRC_DIR> <OUTPUT_DIR> <TARGET_PY>
 """
@@ -32,18 +32,38 @@ info = json.loads(
             target_py,
             "-c",
             "import sysconfig, json; "
-            "print(json.dumps({k: sysconfig.get_config_var(k) "
-            "for k in ('EXT_SUFFIX', 'INCLUDEPY')}))",
+            "print(json.dumps({"
+            "'EXT_SUFFIX': sysconfig.get_config_var('EXT_SUFFIX'), "
+            "'include_candidates': ["
+            "sysconfig.get_path('include'), "
+            "sysconfig.get_path('platinclude'), "
+            "sysconfig.get_config_var('INCLUDEPY'), "
+            "sysconfig.get_config_var('CONFINCLUDEPY')]"
+            "}))",
         ]
     ).decode()
 )
+
+python_include = next(
+    (
+        Path(candidate)
+        for candidate in info["include_candidates"]
+        if candidate and (Path(candidate) / "Python.h").is_file()
+    ),
+    None,
+)
+if python_include is None:
+    sys.exit(
+        "Python.h not found for target interpreter "
+        f"{target_py}; checked {info['include_candidates']}"
+    )
 
 cuda_home = cpp_extension.CUDA_HOME
 if cuda_home is None:
     sys.exit("CUDA_HOME not found; cannot build DeepGEMM _C")
 # CCCL lives outside the standard CUDAToolkit search (mirrors DeepGEMM's setup.py).
 includes = [
-    info["INCLUDEPY"],
+    str(python_include),
     f"{cuda_home}/include",
     f"{cuda_home}/include/cccl",
     str(src / "csrc"),
