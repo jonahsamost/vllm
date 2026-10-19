@@ -15,7 +15,7 @@ import os
 import threading
 import time
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -39,6 +39,32 @@ _PROVENANCE_ENV = {
     "vllm_commit": "VLLM_SIMFER_VLLM_COMMIT",
     "model_config_sha256": "VLLM_SIMFER_MODEL_CONFIG_SHA256",
 }
+
+
+@dataclass(frozen=True)
+class OperationCorrelation:
+    """Exact SimFer identity for one explicitly instrumented operation."""
+
+    physical_operation_id: str
+    semantic_operation_ids: tuple[str, ...]
+    timing_key_id: str
+    dependency_correlation_ids: tuple[str, ...] = ()
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("unsupported SimFer operation-correlation schema")
+        if not self.physical_operation_id or not self.timing_key_id:
+            raise ValueError("SimFer operation correlation is incomplete")
+        for name, values in (
+            ("semantic operation IDs", self.semantic_operation_ids),
+            ("operation dependency IDs", self.dependency_correlation_ids),
+        ):
+            if values != tuple(sorted(set(values))) or any(not value for value in values):
+                raise ValueError(f"SimFer {name} must be nonempty canonical strings")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def enabled() -> bool:
@@ -171,30 +197,92 @@ def record_phase(name: str, *, resource: str = "host", **metadata: Any) -> Any:
     if not enabled():
         yield None
         return
+    if _ACTIVE_STEP is None or _ACTIVE_STEP_CORRELATION is None:
+        raise RuntimeError("SimFer phase range requires an active worker step")
     correlation = _new_correlation_id("phase")
+    with _record_range(name, resource, correlation, metadata, None):
+        yield correlation
+
+
+@contextmanager
+def record_operation(
+    name: str,
+    binding: OperationCorrelation,
+    *,
+    correlation_id: str,
+    resource: str,
+    **metadata: Any,
+) -> Any:
+    """Emit one exact operation range into capture and profiler evidence.
+
+    Callers must provide identities exported by the matching SimFer structural
+    run.  This API intentionally has no symbol-name or ordering fallback: an
+    unbound operation remains whole-step evidence rather than being assigned
+    a plausible but false identity.
+    """
+
+    if not enabled():
+        yield None
+        return
+    if _ACTIVE_STEP is None or _ACTIVE_STEP_CORRELATION is None:
+        raise RuntimeError("SimFer operation range requires an active worker step")
+    if not name or not resource or not correlation_id:
+        raise ValueError(
+            "SimFer operation range requires name, resource, and correlation ID"
+        )
+    operation = binding.to_dict()
+    event_metadata = {"operation_correlation": operation, **metadata}
+    with _record_range(
+        name,
+        resource,
+        correlation_id,
+        event_metadata,
+        {"operation_correlation": operation},
+        repeat_metadata_on_end=True,
+    ):
+        yield correlation_id
+
+
+@contextmanager
+def _record_range(
+    name: str,
+    resource: str,
+    correlation_id: str,
+    event_metadata: dict[str, Any],
+    marker_metadata: dict[str, Any] | None,
+    *,
+    repeat_metadata_on_end: bool = False,
+) -> Any:
     parent = getattr(_ACTIVE_PHASE, "correlation", None)
     if parent is None:
         parent = _ACTIVE_STEP_CORRELATION
     previous = getattr(_ACTIVE_PHASE, "correlation", None)
-    _ACTIVE_PHASE.correlation = correlation
+    _ACTIVE_PHASE.correlation = correlation_id
+    payload = {"name": name, "resource": resource, **event_metadata}
     record_event(
         "phase_start",
-        correlation_id=correlation,
+        correlation_id=correlation_id,
         parent_correlation_id=parent,
-        name=name,
-        resource=resource,
-        **metadata,
+        **payload,
     )
     try:
-        with _profiler_marker(name, correlation, parent):
-            yield correlation
+        with _profiler_marker(
+            name,
+            correlation_id,
+            parent,
+            metadata=marker_metadata,
+        ):
+            yield
     finally:
+        end_payload = payload if repeat_metadata_on_end else {
+            "name": name,
+            "resource": resource,
+        }
         record_event(
             "phase_end",
-            correlation_id=correlation,
+            correlation_id=correlation_id,
             parent_correlation_id=parent,
-            name=name,
-            resource=resource,
+            **end_payload,
         )
         _ACTIVE_PHASE.correlation = previous
 
@@ -300,6 +388,8 @@ def _profiler_marker(
     name: str,
     correlation_id: str,
     parent_correlation_id: str | None,
+    *,
+    metadata: dict[str, Any] | None = None,
 ) -> Any:
     mode = os.environ.get("VLLM_SIMFER_CAPTURE_MARKERS", "torch").lower()
     if mode not in {"none", "torch", "nvtx", "both"}:
@@ -307,14 +397,23 @@ def _profiler_marker(
             "VLLM_SIMFER_CAPTURE_MARKERS must be none, torch, nvtx, or both"
         )
     rank = _rank()
-    payload = json.dumps(
-        {
+    payload_value = {
             "correlation_id": correlation_id,
             "name": name,
             "parent_correlation_id": parent_correlation_id,
             "rank": rank,
             "step_index": _ACTIVE_STEP,
-        },
+        }
+    if metadata:
+        overlap = set(payload_value).intersection(metadata)
+        if overlap:
+            raise ValueError(
+                "SimFer profiler marker metadata shadows reserved fields: "
+                + ", ".join(sorted(overlap))
+            )
+        payload_value.update(_jsonable(metadata))
+    payload = json.dumps(
+        payload_value,
         sort_keys=True,
         separators=(",", ":"),
     ).encode()

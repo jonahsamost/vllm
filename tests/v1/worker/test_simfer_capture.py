@@ -3,14 +3,17 @@ import base64
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
 import torch
 import vllm.v1.worker.simfer_capture as simfer_capture
 
 from vllm.v1.worker.simfer_capture import (
+    OperationCorrelation,
     capture_step,
     record_event,
     record_fx_graph,
     record_model_memory,
+    record_operation,
     record_phase,
 )
 
@@ -128,6 +131,95 @@ def test_capture_records_correlated_host_boundaries(tmp_path, monkeypatch) -> No
     assert marker_payloads[0]["name"] == "worker_step"
     assert marker_payloads[1]["name"] == "model_forward"
     assert marker_payloads[1]["parent_correlation_id"] == events[0]["correlation_id"]
+
+
+def test_capture_emits_exact_operation_identity_to_stream_and_marker(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_ID", "capture-operation")
+    monkeypatch.setenv("VLLM_SIMFER_VLLM_COMMIT", "a" * 40)
+    monkeypatch.setenv("VLLM_SIMFER_MODEL_CONFIG_SHA256", "b" * 64)
+    markers = []
+
+    @contextmanager
+    def record_function(name):
+        markers.append(name)
+        yield
+
+    monkeypatch.setattr(torch.profiler, "record_function", record_function)
+
+    class SchedulerOutput:
+        total_num_scheduled_tokens = 4
+
+    binding = OperationCorrelation(
+        physical_operation_id="physical:attention:0",
+        semantic_operation_ids=("semantic:attention:0",),
+        timing_key_id="measurement-key-v3:attention",
+        dependency_correlation_ids=(),
+    )
+
+    @capture_step
+    def execute(_self, _scheduler_output):
+        with record_operation(
+            "attention",
+            binding,
+            correlation_id="operation:attention:0",
+            resource="gpu:compute",
+        ):
+            return "done"
+
+    assert execute(None, SchedulerOutput()) == "done"
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "rank-0.jsonl").read_text().splitlines()
+    ]
+    operation_events = events[1:3]
+    assert [event["kind"] for event in operation_events] == [
+        "phase_start",
+        "phase_end",
+    ]
+    assert operation_events[0]["correlation_id"] == operation_events[1]["correlation_id"]
+    expected = {
+        **binding.to_dict(),
+        "semantic_operation_ids": ["semantic:attention:0"],
+        "dependency_correlation_ids": [],
+    }
+    assert operation_events[0]["payload"]["operation_correlation"] == expected
+
+    marker = next(value for value in markers if value != markers[0])
+    encoded = marker.removeprefix("simfer:v1:")
+    payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    assert payload["correlation_id"] == operation_events[0]["correlation_id"]
+    assert payload["operation_correlation"] == expected
+
+
+def test_operation_correlation_rejects_noncanonical_dependencies() -> None:
+    with pytest.raises(ValueError, match="canonical strings"):
+        OperationCorrelation(
+            physical_operation_id="physical:attention:0",
+            semantic_operation_ids=("semantic:attention:0",),
+            timing_key_id="measurement-key-v3:attention",
+            dependency_correlation_ids=("second", "first"),
+        )
+
+
+def test_operation_range_requires_active_worker_step(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(tmp_path))
+    binding = OperationCorrelation(
+        physical_operation_id="physical:attention:0",
+        semantic_operation_ids=("semantic:attention:0",),
+        timing_key_id="measurement-key-v3:attention",
+    )
+
+    with pytest.raises(RuntimeError, match="active worker step"):
+        with record_operation(
+            "attention",
+            binding,
+            correlation_id="operation:attention:0",
+            resource="gpu:compute",
+        ):
+            pass
 
 
 def test_capture_profiles_only_selected_step_and_observes_device_completion(
