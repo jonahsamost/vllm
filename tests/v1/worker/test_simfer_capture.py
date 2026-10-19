@@ -1,11 +1,13 @@
-import json
 import base64
+import hashlib
+import json
 from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 import torch
 import vllm.v1.worker.simfer_capture as simfer_capture
+from vllm.utils.simfer_capture import capture_operation_site
 
 from vllm.v1.worker.simfer_capture import (
     OperationCorrelation,
@@ -16,6 +18,33 @@ from vllm.v1.worker.simfer_capture import (
     record_operation,
     record_phase,
 )
+
+
+def _operation_plan(path: Path, capture_id: str) -> Path:
+    binding = {
+        "rank": 0,
+        "step_index": 0,
+        "instrumentation_site": "glm.kda",
+        "occurrence": 0,
+        "correlation_id": "simfer-operation-v1:one",
+        "physical_operation_id": "physical:kda:0",
+        "semantic_operation_ids": ["semantic:kda:0"],
+        "timing_key_id": "measurement-key-v3:kda",
+        "dependency_correlation_ids": [],
+    }
+    identity = {
+        "schema_version": 1,
+        "validation_plan_id": "validation-plan-v1:test",
+        "expected_capture_id": capture_id,
+        "bindings": [binding],
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    value = {
+        "id": "operation-range-plan-v1:" + hashlib.sha256(encoded).hexdigest(),
+        **identity,
+    }
+    path.write_text(json.dumps(value))
+    return path
 
 
 class TiedModel(torch.nn.Module):
@@ -220,6 +249,75 @@ def test_operation_range_requires_active_worker_step(tmp_path, monkeypatch) -> N
             resource="gpu:compute",
         ):
             pass
+
+
+def test_bound_operation_claims_exact_plan_entry_and_closes_step(
+    tmp_path, monkeypatch
+) -> None:
+    capture = tmp_path / "capture"
+    plan = _operation_plan(tmp_path / "operation-plan.json", "capture-bound")
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(capture))
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_ID", "capture-bound")
+    monkeypatch.setenv("VLLM_SIMFER_VLLM_COMMIT", "a" * 40)
+    monkeypatch.setenv("VLLM_SIMFER_MODEL_CONFIG_SHA256", "b" * 64)
+    monkeypatch.setenv("VLLM_SIMFER_OPERATION_PLAN", str(plan))
+    monkeypatch.setattr(simfer_capture, "_NEXT_STEP", 0)
+    monkeypatch.setattr(simfer_capture, "_OPERATION_PLAN_PATH", None)
+    monkeypatch.setattr(simfer_capture, "_OPERATION_PLAN", {})
+    monkeypatch.setattr(simfer_capture, "_OPERATION_OCCURRENCES", {})
+    monkeypatch.setattr(simfer_capture, "_CLAIMED_OPERATION_BINDINGS", set())
+
+    class SchedulerOutput:
+        total_num_scheduled_tokens = 4
+
+    @capture_operation_site("glm.kda", "kda")
+    def kda():
+        return "done"
+
+    @capture_step
+    def execute(_self, _scheduler_output):
+        return kda()
+
+    assert execute(None, SchedulerOutput()) == "done"
+    events = [
+        json.loads(line)
+        for line in (capture / "rank-0.jsonl").read_text().splitlines()
+    ]
+    assert events[1]["payload"]["operation_correlation"] == {
+        "schema_version": 1,
+        "physical_operation_id": "physical:kda:0",
+        "semantic_operation_ids": ["semantic:kda:0"],
+        "timing_key_id": "measurement-key-v3:kda",
+        "dependency_correlation_ids": [],
+    }
+    assert events[-1]["payload"]["operation_bindings_complete"] is True
+
+
+def test_bound_operation_fails_step_when_exact_binding_is_unclaimed(
+    tmp_path, monkeypatch
+) -> None:
+    capture = tmp_path / "capture"
+    plan = _operation_plan(tmp_path / "operation-plan.json", "capture-missing")
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(capture))
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_ID", "capture-missing")
+    monkeypatch.setenv("VLLM_SIMFER_VLLM_COMMIT", "a" * 40)
+    monkeypatch.setenv("VLLM_SIMFER_MODEL_CONFIG_SHA256", "b" * 64)
+    monkeypatch.setenv("VLLM_SIMFER_OPERATION_PLAN", str(plan))
+    monkeypatch.setattr(simfer_capture, "_NEXT_STEP", 0)
+    monkeypatch.setattr(simfer_capture, "_OPERATION_PLAN_PATH", None)
+    monkeypatch.setattr(simfer_capture, "_OPERATION_PLAN", {})
+    monkeypatch.setattr(simfer_capture, "_OPERATION_OCCURRENCES", {})
+    monkeypatch.setattr(simfer_capture, "_CLAIMED_OPERATION_BINDINGS", set())
+
+    class SchedulerOutput:
+        total_num_scheduled_tokens = 4
+
+    @capture_step
+    def execute(_self, _scheduler_output):
+        return "done"
+
+    with pytest.raises(RuntimeError, match="unclaimed bindings"):
+        execute(None, SchedulerOutput())
 
 
 def test_capture_profiles_only_selected_step_and_observes_device_completion(

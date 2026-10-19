@@ -10,6 +10,7 @@ Set ``VLLM_SIMFER_CAPTURE_DIR`` to emit one JSONL stream per worker rank.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import threading
@@ -34,6 +35,10 @@ _ACTIVE_STEP: int | None = None
 _ACTIVE_STEP_CORRELATION: str | None = None
 _ACTIVE_PHASE = threading.local()
 _INITIALIZED_STREAMS: set[Path] = set()
+_OPERATION_PLAN_PATH: Path | None = None
+_OPERATION_PLAN: dict[tuple[int, int, str, int], dict[str, Any]] = {}
+_OPERATION_OCCURRENCES: dict[tuple[int, int, str], int] = {}
+_CLAIMED_OPERATION_BINDINGS: set[tuple[int, int, str, int]] = set()
 _PROVENANCE_ENV = {
     "capture_id": "VLLM_SIMFER_CAPTURE_ID",
     "vllm_commit": "VLLM_SIMFER_VLLM_COMMIT",
@@ -244,6 +249,178 @@ def record_operation(
 
 
 @contextmanager
+def record_bound_operation(
+    instrumentation_site: str,
+    name: str,
+    *,
+    resource: str = "gpu",
+    **metadata: Any,
+) -> Any:
+    """Record the next exact structural binding for one pinned call site.
+
+    The content-addressed plan is produced before observation.  A call site is
+    never matched by symbol name, shape, or best effort: rank, worker step,
+    site, and occurrence must all agree.  If no plan is configured the helper
+    is a zero-overhead semantic no-op apart from entering this Python context.
+    """
+
+    if not enabled() or not os.environ.get("VLLM_SIMFER_OPERATION_PLAN"):
+        yield None
+        return
+    if not instrumentation_site:
+        raise ValueError("SimFer instrumentation site cannot be empty")
+    binding, correlation_id = _claim_operation_binding(instrumentation_site)
+    with record_operation(
+        name,
+        binding,
+        correlation_id=correlation_id,
+        resource=resource,
+        instrumentation_site=instrumentation_site,
+        **metadata,
+    ):
+        yield correlation_id
+
+
+def _claim_operation_binding(
+    instrumentation_site: str,
+) -> tuple[OperationCorrelation, str]:
+    if _ACTIVE_STEP is None:
+        raise RuntimeError("SimFer bound operation requires an active worker step")
+    _load_operation_plan()
+    rank = _rank()
+    occurrence_key = (rank, _ACTIVE_STEP, instrumentation_site)
+    occurrence = _OPERATION_OCCURRENCES.get(occurrence_key, 0)
+    key = (*occurrence_key, occurrence)
+    try:
+        item = _OPERATION_PLAN[key]
+    except KeyError:
+        raise RuntimeError(
+            "SimFer operation plan has no binding for "
+            f"rank={rank}, step={_ACTIVE_STEP}, site={instrumentation_site!r}, "
+            f"occurrence={occurrence}"
+        ) from None
+    _OPERATION_OCCURRENCES[occurrence_key] = occurrence + 1
+    _CLAIMED_OPERATION_BINDINGS.add(key)
+    return (
+        OperationCorrelation(
+            physical_operation_id=item["physical_operation_id"],
+            semantic_operation_ids=tuple(item["semantic_operation_ids"]),
+            timing_key_id=item["timing_key_id"],
+            dependency_correlation_ids=tuple(item["dependency_correlation_ids"]),
+        ),
+        item["correlation_id"],
+    )
+
+
+def _load_operation_plan() -> None:
+    global _OPERATION_PLAN_PATH, _OPERATION_PLAN
+    global _OPERATION_OCCURRENCES, _CLAIMED_OPERATION_BINDINGS
+    path = Path(os.environ["VLLM_SIMFER_OPERATION_PLAN"]).resolve()
+    if _OPERATION_PLAN_PATH == path:
+        return
+    value = json.loads(path.read_text())
+    if set(value) != {
+        "id",
+        "schema_version",
+        "validation_plan_id",
+        "expected_capture_id",
+        "bindings",
+    }:
+        raise ValueError("SimFer operation-range plan fields disagree with schema")
+    if value.get("schema_version") != 1:
+        raise ValueError("unsupported SimFer operation-range plan schema")
+    identity = {key: item for key, item in value.items() if key != "id"}
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    expected_id = "operation-range-plan-v1:" + hashlib.sha256(encoded).hexdigest()
+    if value["id"] != expected_id:
+        raise ValueError("SimFer operation-range plan ID does not match content")
+    expected_capture = os.environ.get("VLLM_SIMFER_CAPTURE_ID")
+    if expected_capture and value.get("expected_capture_id") != expected_capture:
+        raise ValueError("SimFer operation plan targets another capture")
+    required = {
+        "rank",
+        "step_index",
+        "instrumentation_site",
+        "occurrence",
+        "correlation_id",
+        "physical_operation_id",
+        "semantic_operation_ids",
+        "timing_key_id",
+        "dependency_correlation_ids",
+    }
+    indexed = {}
+    coordinates = []
+    correlations = set()
+    for item in value.get("bindings", ()):
+        if set(item) != required:
+            raise ValueError("SimFer operation binding fields disagree with schema")
+        key = (
+            item["rank"],
+            item["step_index"],
+            item["instrumentation_site"],
+            item["occurrence"],
+        )
+        numeric_coordinates = (*key[:2], key[3])
+        if (
+            not all(
+                isinstance(coordinate, int) for coordinate in numeric_coordinates
+            )
+            or any(coordinate < 0 for coordinate in numeric_coordinates)
+            or not isinstance(key[2], str)
+            or not key[2]
+        ):
+            raise ValueError("SimFer operation binding coordinates are invalid")
+        for field in (
+            "correlation_id",
+            "physical_operation_id",
+            "timing_key_id",
+        ):
+            if not isinstance(item[field], str) or not item[field]:
+                raise ValueError("SimFer operation binding identity is incomplete")
+        for field in (
+            "semantic_operation_ids",
+            "dependency_correlation_ids",
+        ):
+            values = item[field]
+            if (
+                not isinstance(values, list)
+                or values != sorted(set(values))
+                or any(not isinstance(entry, str) or not entry for entry in values)
+            ):
+                raise ValueError("SimFer operation binding values are not canonical")
+        if key in indexed:
+            raise ValueError("SimFer operation plan repeats a call-site binding")
+        if item["correlation_id"] in correlations:
+            raise ValueError("SimFer operation plan repeats a correlation ID")
+        indexed[key] = item
+        coordinates.append(key)
+        correlations.add(item["correlation_id"])
+    if coordinates != sorted(coordinates):
+        raise ValueError("SimFer operation plan bindings are not canonical")
+    _OPERATION_PLAN_PATH = path
+    _OPERATION_PLAN = indexed
+    _OPERATION_OCCURRENCES = {}
+    _CLAIMED_OPERATION_BINDINGS = set()
+
+
+def _verify_step_operation_bindings(step_index: int) -> None:
+    if not os.environ.get("VLLM_SIMFER_OPERATION_PLAN"):
+        return
+    _load_operation_plan()
+    rank = _rank()
+    expected = {
+        key for key in _OPERATION_PLAN if key[0] == rank and key[1] == step_index
+    }
+    missing = expected - _CLAIMED_OPERATION_BINDINGS
+    if missing:
+        sites = sorted((key[2], key[3]) for key in missing)
+        raise RuntimeError(
+            f"SimFer operation plan left unclaimed bindings for rank={rank}, "
+            f"step={step_index}: {sites}"
+        )
+
+
+@contextmanager
 def _record_range(
     name: str,
     resource: str,
@@ -313,15 +490,25 @@ def _end_step(
     device_completion_observed: bool = False,
 ) -> None:
     global _ACTIVE_STEP, _ACTIVE_STEP_CORRELATION
+    step_index = _ACTIVE_STEP
+    binding_error: RuntimeError | None = None
+    if outcome == "completed" and step_index is not None:
+        try:
+            _verify_step_operation_bindings(step_index)
+        except RuntimeError as error:
+            binding_error = error
     record_event(
         "step_end",
         correlation_id=correlation,
         outcome=outcome,
         boundary="host_api_return",
         device_completion_observed=device_completion_observed,
+        operation_bindings_complete=binding_error is None,
     )
     _ACTIVE_STEP = None
     _ACTIVE_STEP_CORRELATION = None
+    if binding_error is not None:
+        raise binding_error
 
 
 def _claim_profile_path(scheduler_output: Any) -> Path | None:

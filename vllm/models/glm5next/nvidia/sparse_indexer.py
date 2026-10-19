@@ -24,6 +24,7 @@ from vllm.models.glm5next.common.sparse_indexer import (
 from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import has_deep_gemm
+from vllm.utils.simfer_capture import capture_operation_site
 from vllm.utils.torch_utils import (
     LayerNameType,
     _resolve_layer_name,
@@ -700,6 +701,7 @@ class SparseAttnIndexerKpool(CustomOp):
             positions=positions,
         )
 
+    @capture_operation_site("glm.sparse_indexer", "glm_sparse_indexer")
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,

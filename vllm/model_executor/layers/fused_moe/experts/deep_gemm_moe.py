@@ -46,6 +46,7 @@ from vllm.utils.deep_gemm import (
     mk_alignment_scope,
 )
 from vllm.utils.import_utils import has_deep_gemm
+from vllm.utils.simfer_capture import capture_operation_site
 
 logger = init_logger(__name__)
 
@@ -305,6 +306,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             act_out, block_k, column_major_scales=True, out_q=output
         )
 
+    @capture_operation_site("provider.deep_gemm.experts", "deep_gemm_experts")
     def apply(
         self,
         output: torch.Tensor,
@@ -560,6 +562,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
             use_ue8m0=use_ue8m0,
         )
 
+    @capture_operation_site("provider.deep_gemm.experts", "deep_gemm_fp4_experts")
     def apply(
         self,
         output: torch.Tensor,
