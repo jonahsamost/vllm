@@ -74,6 +74,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.simfer_service_timing import RECORDER as _SIMFER_SERVICE_TIMING
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -218,6 +219,11 @@ class EngineCore:
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+        if _SIMFER_SERVICE_TIMING.enabled and self.batch_queue is not None:
+            raise RuntimeError(
+                "SimFer production service timing does not support pipelined "
+                "EngineCore batches"
+            )
 
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
@@ -638,9 +644,13 @@ class EngineCore:
         """
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
+        service_started_ns = _SIMFER_SERVICE_TIMING.begin()
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        service_selection = _SIMFER_SERVICE_TIMING.claim(
+            scheduler_output, started_ns=service_started_ns
+        )
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -659,6 +669,7 @@ class EngineCore:
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
+        _SIMFER_SERVICE_TIMING.finish(service_selection)
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
