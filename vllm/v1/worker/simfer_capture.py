@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in structural and composition evidence for SimFer conformance.
 
-This module does not synchronize a device, time kernels, retain tensors, or
-alter dispatch. Host timestamps describe enqueue/lifecycle boundaries only;
-device-completion timing must come from a correlated profiler capture.
+Ordinary structural capture does not synchronize a device, time kernels,
+retain tensors, or alter dispatch. Explicitly selected production service
+samples bracket an otherwise uninstrumented worker step with device
+synchronization; profiler captures remain separate diagnostic evidence.
 Set ``VLLM_SIMFER_CAPTURE_DIR`` to emit one JSONL stream per worker rank.
 """
 
@@ -22,6 +23,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
+from vllm.v1.worker.simfer_service_timing import (
+    claim_service_timing,
+    observe_service_time,
+)
 
 
 _SCHEMA_VERSION = 2
@@ -148,7 +154,13 @@ def record_runtime_dispatch(
 
 
 def capture_step(function: Any) -> Any:
-    """Record one worker API span without forcing device synchronization."""
+    """Record one worker API span and explicitly selected timing evidence.
+
+    Ordinary structural capture remains asynchronous. Profiler selection and
+    service-time selection are separate, mutually exclusive contracts:
+    profiler spans are diagnostic evidence, while service timing observes
+    device completion without enabling a profiler.
+    """
 
     @wraps(function)
     def wrapped(self: Any, scheduler_output: Any, *args: Any, **kwargs: Any) -> Any:
@@ -157,10 +169,36 @@ def capture_step(function: Any) -> Any:
         correlation = _begin_step(scheduler_output)
         outcome = "completed"
         profile_path = None
+        service_sample_index: int | None = None
+        service_timing_observed = False
         try:
             profile_path = _claim_profile_path(scheduler_output)
+            service_sample_index = claim_service_timing(scheduler_output)
+            if profile_path is not None and service_sample_index is not None:
+                raise RuntimeError(
+                    "SimFer profiler and service timing selected the same step"
+                )
             _activate_operation_step(profile_path)
             if profile_path is None:
+                if service_sample_index is not None:
+                    result, observation = observe_service_time(
+                        lambda: function(self, scheduler_output, *args, **kwargs)
+                    )
+                    record_event(
+                        "service_timing",
+                        correlation_id=correlation,
+                        duration_ns=observation.duration_ns,
+                        service_sample_index=service_sample_index,
+                        service_started_ns=observation.started_ns,
+                        service_finished_ns=observation.finished_ns,
+                        scheduled_tokens=getattr(
+                            scheduler_output, "total_num_scheduled_tokens", None
+                        ),
+                        timer="host_perf_counter_bracketed_by_device_sync",
+                        instrumentation="uninstrumented",
+                    )
+                    service_timing_observed = True
+                    return result
                 with _profiler_marker("worker_step", correlation, None):
                     return function(self, scheduler_output, *args, **kwargs)
             with torch.profiler.profile(
@@ -194,7 +232,10 @@ def capture_step(function: Any) -> Any:
             _end_step(
                 correlation,
                 outcome,
-                device_completion_observed=profile_path is not None,
+                device_completion_observed=(
+                    profile_path is not None or service_timing_observed
+                ),
+                service_timing_observed=service_timing_observed,
             )
 
     return wrapped
@@ -520,6 +561,7 @@ def _end_step(
     outcome: str,
     *,
     device_completion_observed: bool = False,
+    service_timing_observed: bool = False,
 ) -> None:
     global _ACTIVE_STEP, _ACTIVE_STEP_CORRELATION, _ACTIVE_OPERATION_STEP
     operation_step_index = _ACTIVE_OPERATION_STEP
@@ -535,6 +577,7 @@ def _end_step(
         outcome=outcome,
         boundary="host_api_return",
         device_completion_observed=device_completion_observed,
+        service_timing_observed=service_timing_observed,
         operation_bindings_complete=(
             None if operation_step_index is None else binding_error is None
         ),

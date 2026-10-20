@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import vllm.v1.worker.simfer_capture as simfer_capture
+import vllm.v1.worker.simfer_service_timing as simfer_service_timing
 from vllm.utils.simfer_capture import capture_operation_site
 from vllm.v1.worker.simfer_capture import (
     OperationCorrelation,
@@ -546,3 +547,118 @@ def test_capture_can_skip_matching_warmup_step(tmp_path, monkeypatch) -> None:
     execute(None, SchedulerOutput())
 
     assert len(tuple((tmp_path / "traces").glob("*.pt.trace.json"))) == 1
+
+
+def test_capture_records_separate_uninstrumented_service_timing(
+    tmp_path, monkeypatch
+) -> None:
+    capture = tmp_path / "capture"
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(capture))
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_ID", "capture-service-time")
+    monkeypatch.setenv("VLLM_SIMFER_VLLM_COMMIT", "a" * 40)
+    monkeypatch.setenv("VLLM_SIMFER_MODEL_CONFIG_SHA256", "b" * 64)
+    monkeypatch.setenv("VLLM_SIMFER_SERVICE_TIMING_TOKEN_COUNTS", "8")
+    monkeypatch.setenv("VLLM_SIMFER_SERVICE_TIMING_SKIP_MATCHES", "1")
+    monkeypatch.setenv("VLLM_SIMFER_SERVICE_TIMING_MAX_STEPS", "1")
+    monkeypatch.setattr(
+        simfer_service_timing,
+        "_SELECTOR",
+        simfer_service_timing.ServiceTimingSelector(),
+    )
+    synchronized = []
+    timestamps = iter((10, 37))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: synchronized.append(True))
+    monkeypatch.setattr(
+        simfer_service_timing.time, "perf_counter_ns", lambda: next(timestamps)
+    )
+
+    class SchedulerOutput:
+        total_num_scheduled_tokens = 8
+
+    @capture_step
+    def execute(_self, _scheduler_output):
+        return "done"
+
+    execute(None, SchedulerOutput())
+    execute(None, SchedulerOutput())
+    events = [
+        json.loads(line)
+        for line in (capture / "rank-0.jsonl").read_text().splitlines()
+    ]
+    timing = [event for event in events if event["kind"] == "service_timing"]
+    step_ends = [event for event in events if event["kind"] == "step_end"]
+
+    assert synchronized == [True, True]
+    assert len(timing) == 1
+    assert timing[0]["payload"] == {
+        "duration_ns": 27,
+        "instrumentation": "uninstrumented",
+        "service_sample_index": 0,
+        "service_started_ns": 10,
+        "service_finished_ns": 37,
+        "scheduled_tokens": 8,
+        "timer": "host_perf_counter_bracketed_by_device_sync",
+    }
+    assert step_ends[0]["payload"]["service_timing_observed"] is False
+    assert step_ends[1]["payload"]["service_timing_observed"] is True
+
+
+def test_capture_rejects_profiler_and_service_timing_on_same_step(
+    tmp_path, monkeypatch
+) -> None:
+    capture = tmp_path / "capture"
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(capture))
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_ID", "capture-overlap")
+    monkeypatch.setenv("VLLM_SIMFER_VLLM_COMMIT", "a" * 40)
+    monkeypatch.setenv("VLLM_SIMFER_MODEL_CONFIG_SHA256", "b" * 64)
+    monkeypatch.setenv("VLLM_SIMFER_SERVICE_TIMING_TOKEN_COUNTS", "4")
+    monkeypatch.setattr(
+        simfer_service_timing,
+        "_SELECTOR",
+        simfer_service_timing.ServiceTimingSelector(),
+    )
+    _enable_fake_profile(tmp_path, monkeypatch)
+
+    class SchedulerOutput:
+        total_num_scheduled_tokens = 4
+
+    @capture_step
+    def execute(_self, _scheduler_output):
+        return "done"
+
+    with pytest.raises(RuntimeError, match="selected the same step"):
+        execute(None, SchedulerOutput())
+
+
+def test_failed_service_timing_does_not_claim_device_completion(
+    tmp_path, monkeypatch
+) -> None:
+    capture = tmp_path / "capture"
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(capture))
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_ID", "capture-service-failure")
+    monkeypatch.setenv("VLLM_SIMFER_VLLM_COMMIT", "a" * 40)
+    monkeypatch.setenv("VLLM_SIMFER_MODEL_CONFIG_SHA256", "b" * 64)
+    monkeypatch.setenv("VLLM_SIMFER_SERVICE_TIMING_TOKEN_COUNTS", "4")
+    monkeypatch.setattr(
+        simfer_service_timing,
+        "_SELECTOR",
+        simfer_service_timing.ServiceTimingSelector(),
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    class SchedulerOutput:
+        total_num_scheduled_tokens = 4
+
+    @capture_step
+    def execute(_self, _scheduler_output):
+        raise RuntimeError("execution failed")
+
+    with pytest.raises(RuntimeError, match="execution failed"):
+        execute(None, SchedulerOutput())
+    events = [
+        json.loads(line)
+        for line in (capture / "rank-0.jsonl").read_text().splitlines()
+    ]
+    assert [event["kind"] for event in events] == ["step_start", "step_end"]
+    assert events[-1]["payload"]["device_completion_observed"] is False
+    assert events[-1]["payload"]["service_timing_observed"] is False
