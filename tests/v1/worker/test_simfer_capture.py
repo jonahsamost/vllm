@@ -1,3 +1,4 @@
+import ast
 import base64
 import hashlib
 import json
@@ -264,6 +265,29 @@ def test_step_phase_ignores_capture_lifecycle_work_outside_worker_step(
         assert correlation is None
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_warmup_sample_tokens_uses_only_lifecycle_aware_phases() -> None:
+    """Every nested range in vLLM's warmup entry point must tolerate no step."""
+
+    source = (
+        Path(simfer_capture.__file__).parent / "gpu" / "model_runner.py"
+    ).read_text()
+    module = ast.parse(source)
+    sample_tokens = next(
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens"
+    )
+    strict_phase_calls = [
+        node
+        for node in ast.walk(sample_tokens)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "record_phase"
+    ]
+
+    assert strict_phase_calls == []
 
 
 def test_step_phase_records_work_inside_worker_step(tmp_path, monkeypatch) -> None:

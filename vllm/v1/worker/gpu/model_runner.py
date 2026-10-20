@@ -2071,9 +2071,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for states in aux_hidden_states
             ]
 
-        # Sampling is also invoked during engine kernel warmup, before a
-        # scheduler worker-step exists. Keep that lifecycle work under the
-        # enclosing warmup timer; only emit the nested range for real steps.
+        # This entire method is also invoked during engine kernel warmup,
+        # before a scheduler worker-step exists. Keep lifecycle work under the
+        # enclosing warmup timer; only emit its nested ranges for real steps.
         with simfer_capture.record_step_phase("sampling", resource="gpu"):
             sampler_output, num_sampled, num_rejected = self.sample(
                 hidden_states, input_batch, grammar_output
@@ -2146,7 +2146,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
-        with simfer_capture.record_phase("bookkeeping"):
+        with simfer_capture.record_step_phase("bookkeeping"):
             self.postprocess_sampled(
                 input_batch.idx_mapping,
                 sampler_output.sampled_token_ids,
@@ -2174,7 +2174,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler._get_contexts(input_batch.idx_mapping),
                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
                 )
-            with simfer_capture.record_phase(
+            with simfer_capture.record_step_phase(
                 "speculative_draft", resource="gpu"
             ):
                 with use_workspace_lane(self._draft_workspace_lane):
