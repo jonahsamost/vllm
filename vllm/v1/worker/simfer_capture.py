@@ -33,6 +33,7 @@ _PROFILED_STEPS = 0
 _PROFILE_MATCHES = 0
 _ACTIVE_STEP: int | None = None
 _ACTIVE_STEP_CORRELATION: str | None = None
+_ACTIVE_OPERATION_STEP: int | None = None
 _ACTIVE_PHASE = threading.local()
 _INITIALIZED_STREAMS: set[Path] = set()
 _OPERATION_PLAN_PATH: Path | None = None
@@ -155,8 +156,10 @@ def capture_step(function: Any) -> Any:
             return function(self, scheduler_output, *args, **kwargs)
         correlation = _begin_step(scheduler_output)
         outcome = "completed"
-        profile_path = _claim_profile_path(scheduler_output)
+        profile_path = None
         try:
+            profile_path = _claim_profile_path(scheduler_output)
+            _activate_operation_step(profile_path)
             if profile_path is None:
                 with _profiler_marker("worker_step", correlation, None):
                     return function(self, scheduler_output, *args, **kwargs)
@@ -286,7 +289,11 @@ def record_bound_operation(
     is a zero-overhead semantic no-op apart from entering this Python context.
     """
 
-    if not enabled() or not os.environ.get("VLLM_SIMFER_OPERATION_PLAN"):
+    if (
+        not enabled()
+        or not os.environ.get("VLLM_SIMFER_OPERATION_PLAN")
+        or _ACTIVE_OPERATION_STEP is None
+    ):
         yield None
         return
     if not instrumentation_site:
@@ -306,11 +313,11 @@ def record_bound_operation(
 def _claim_operation_binding(
     instrumentation_site: str,
 ) -> tuple[OperationCorrelation, str]:
-    if _ACTIVE_STEP is None:
-        raise RuntimeError("SimFer bound operation requires an active worker step")
+    if _ACTIVE_OPERATION_STEP is None:
+        raise RuntimeError("SimFer bound operation requires an active profiled step")
     _load_operation_plan()
     rank = _rank()
-    occurrence_key = (rank, _ACTIVE_STEP, instrumentation_site)
+    occurrence_key = (rank, _ACTIVE_OPERATION_STEP, instrumentation_site)
     occurrence = _OPERATION_OCCURRENCES.get(occurrence_key, 0)
     key = (*occurrence_key, occurrence)
     try:
@@ -318,7 +325,8 @@ def _claim_operation_binding(
     except KeyError:
         raise RuntimeError(
             "SimFer operation plan has no binding for "
-            f"rank={rank}, step={_ACTIVE_STEP}, site={instrumentation_site!r}, "
+            f"rank={rank}, step={_ACTIVE_OPERATION_STEP}, "
+            f"site={instrumentation_site!r}, "
             f"occurrence={occurrence}"
         ) from None
     _OPERATION_OCCURRENCES[occurrence_key] = occurrence + 1
@@ -425,8 +433,10 @@ def _load_operation_plan() -> None:
     _CLAIMED_OPERATION_BINDINGS = set()
 
 
-def _verify_step_operation_bindings(step_index: int) -> None:
+def _verify_step_operation_bindings(step_index: int | None) -> None:
     if not os.environ.get("VLLM_SIMFER_OPERATION_PLAN"):
+        return
+    if step_index is None:
         return
     _load_operation_plan()
     rank = _rank()
@@ -511,12 +521,12 @@ def _end_step(
     *,
     device_completion_observed: bool = False,
 ) -> None:
-    global _ACTIVE_STEP, _ACTIVE_STEP_CORRELATION
-    step_index = _ACTIVE_STEP
+    global _ACTIVE_STEP, _ACTIVE_STEP_CORRELATION, _ACTIVE_OPERATION_STEP
+    operation_step_index = _ACTIVE_OPERATION_STEP
     binding_error: RuntimeError | None = None
-    if outcome == "completed" and step_index is not None:
+    if outcome == "completed":
         try:
-            _verify_step_operation_bindings(step_index)
+            _verify_step_operation_bindings(operation_step_index)
         except RuntimeError as error:
             binding_error = error
     record_event(
@@ -525,12 +535,42 @@ def _end_step(
         outcome=outcome,
         boundary="host_api_return",
         device_completion_observed=device_completion_observed,
-        operation_bindings_complete=binding_error is None,
+        operation_bindings_complete=(
+            None if operation_step_index is None else binding_error is None
+        ),
     )
     _ACTIVE_STEP = None
     _ACTIVE_STEP_CORRELATION = None
+    _ACTIVE_OPERATION_STEP = None
     if binding_error is not None:
         raise binding_error
+
+
+def _activate_operation_step(profile_path: Path | None) -> None:
+    """Bind operation obligations only to an intentionally profiled step.
+
+    Runtime step numbers include unprofiled warmup and selection misses.  A
+    range plan instead uses a capture-local coordinate supplied explicitly by
+    the probe.  Keeping those namespaces separate prevents warmup count from
+    silently changing operation identity.
+    """
+
+    global _ACTIVE_OPERATION_STEP
+    _ACTIVE_OPERATION_STEP = None
+    if profile_path is None or not os.environ.get("VLLM_SIMFER_OPERATION_PLAN"):
+        return
+    try:
+        step_index = int(os.environ.get("VLLM_SIMFER_OPERATION_STEP_INDEX", "0"))
+        maximum = int(os.environ.get("VLLM_SIMFER_PROFILE_MAX_STEPS", "1"))
+    except ValueError as error:
+        raise ValueError("invalid SimFer operation-step selection") from error
+    if step_index < 0:
+        raise ValueError("VLLM_SIMFER_OPERATION_STEP_INDEX cannot be negative")
+    if maximum != 1:
+        raise ValueError(
+            "operation-bound capture requires VLLM_SIMFER_PROFILE_MAX_STEPS=1"
+        )
+    _ACTIVE_OPERATION_STEP = step_index
 
 
 def _claim_profile_path(scheduler_output: Any) -> Path | None:

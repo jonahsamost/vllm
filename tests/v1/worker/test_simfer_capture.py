@@ -49,6 +49,27 @@ def _operation_plan(path: Path, capture_id: str) -> Path:
     return path
 
 
+def _enable_fake_profile(tmp_path: Path, monkeypatch) -> None:
+    class FakeProfiler:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def export_chrome_trace(self, path):
+            Path(path).write_text('{"traceEvents": []}')
+
+    monkeypatch.setenv("VLLM_SIMFER_PROFILE_DIR", str(tmp_path / "traces"))
+    monkeypatch.setenv("VLLM_SIMFER_PROFILE_TOKEN_COUNTS", "4")
+    monkeypatch.setenv("VLLM_SIMFER_PROFILE_MAX_STEPS", "1")
+    monkeypatch.setattr(simfer_capture, "_PROFILED_STEPS", 0)
+    monkeypatch.setattr(simfer_capture, "_PROFILE_MATCHES", 0)
+    monkeypatch.setattr(simfer_capture, "_ACTIVE_OPERATION_STEP", None)
+    monkeypatch.setattr(torch.profiler, "profile", lambda **_kwargs: FakeProfiler())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+
 class TiedModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -333,6 +354,7 @@ def test_bound_operation_claims_exact_plan_entry_and_closes_step(
     monkeypatch.setattr(simfer_capture, "_OPERATION_PLAN", {})
     monkeypatch.setattr(simfer_capture, "_OPERATION_OCCURRENCES", {})
     monkeypatch.setattr(simfer_capture, "_CLAIMED_OPERATION_BINDINGS", set())
+    _enable_fake_profile(tmp_path, monkeypatch)
 
     class SchedulerOutput:
         total_num_scheduled_tokens = 4
@@ -375,6 +397,7 @@ def test_bound_operation_fails_step_when_exact_binding_is_unclaimed(
     monkeypatch.setattr(simfer_capture, "_OPERATION_PLAN", {})
     monkeypatch.setattr(simfer_capture, "_OPERATION_OCCURRENCES", {})
     monkeypatch.setattr(simfer_capture, "_CLAIMED_OPERATION_BINDINGS", set())
+    _enable_fake_profile(tmp_path, monkeypatch)
 
     class SchedulerOutput:
         total_num_scheduled_tokens = 4
@@ -385,6 +408,55 @@ def test_bound_operation_fails_step_when_exact_binding_is_unclaimed(
 
     with pytest.raises(RuntimeError, match="unclaimed bindings"):
         execute(None, SchedulerOutput())
+
+
+def test_bound_operation_ignores_unprofiled_match_then_uses_local_step_zero(
+    tmp_path, monkeypatch
+) -> None:
+    capture = tmp_path / "capture"
+    plan = _operation_plan(tmp_path / "operation-plan.json", "capture-selected")
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(capture))
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_ID", "capture-selected")
+    monkeypatch.setenv("VLLM_SIMFER_VLLM_COMMIT", "a" * 40)
+    monkeypatch.setenv("VLLM_SIMFER_MODEL_CONFIG_SHA256", "b" * 64)
+    monkeypatch.setenv("VLLM_SIMFER_OPERATION_PLAN", str(plan))
+    monkeypatch.setenv("VLLM_SIMFER_PROFILE_SKIP_MATCHES", "1")
+    monkeypatch.setattr(simfer_capture, "_NEXT_STEP", 0)
+    monkeypatch.setattr(simfer_capture, "_OPERATION_PLAN_PATH", None)
+    monkeypatch.setattr(simfer_capture, "_OPERATION_PLAN", {})
+    monkeypatch.setattr(simfer_capture, "_OPERATION_OCCURRENCES", {})
+    monkeypatch.setattr(simfer_capture, "_CLAIMED_OPERATION_BINDINGS", set())
+    _enable_fake_profile(tmp_path, monkeypatch)
+
+    class SchedulerOutput:
+        total_num_scheduled_tokens = 4
+
+    @capture_operation_site("glm.kda", "kda")
+    def kda():
+        return "done"
+
+    @capture_step
+    def execute(_self, _scheduler_output):
+        return kda()
+
+    assert execute(None, SchedulerOutput()) == "done"
+    assert execute(None, SchedulerOutput()) == "done"
+    events = [
+        json.loads(line)
+        for line in (capture / "rank-0.jsonl").read_text().splitlines()
+    ]
+    operation_starts = [
+        event
+        for event in events
+        if event["kind"] == "phase_start"
+        and event["payload"]["name"] == "kda"
+    ]
+    assert len(operation_starts) == 1
+    assert operation_starts[0]["step_index"] == 1
+    assert operation_starts[0]["correlation_id"] == "simfer-operation-v1:one"
+    step_ends = [event for event in events if event["kind"] == "step_end"]
+    assert step_ends[0]["payload"]["operation_bindings_complete"] is None
+    assert step_ends[1]["payload"]["operation_bindings_complete"] is True
 
 
 def test_capture_profiles_only_selected_step_and_observes_device_completion(
