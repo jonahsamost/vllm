@@ -1,4 +1,5 @@
 import json
+from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -170,6 +171,102 @@ def test_engine_core_step_encloses_schedule_execution_and_reconciliation(
     assert events == [
         "begin",
         "has-requests",
+        "schedule",
+        "claim",
+        "execute",
+        "model-result",
+        "reconcile",
+        "finish",
+    ]
+
+
+def test_engine_core_batch_queue_finishes_the_matching_scheduled_selection(
+    monkeypatch,
+) -> None:
+    events = []
+    output = SimpleNamespace(
+        total_num_scheduled_tokens=4,
+        num_scheduled_tokens={"request": 4},
+        pending_structured_output_tokens=False,
+    )
+
+    class Recorder:
+        def begin(self):
+            events.append("begin")
+            return 10
+
+        def claim(self, scheduler_output, *, started_ns):
+            assert scheduler_output is output
+            assert started_ns == 10
+            events.append("claim")
+            return "queued-selection"
+
+        def finish(self, selection):
+            assert selection == "queued-selection"
+            events.append("finish")
+
+    class Scheduler:
+        requests = True
+
+        def has_requests(self):
+            return self.requests
+
+        def schedule(self, _throttle):
+            events.append("schedule")
+            self.requests = False
+            return output
+
+        def get_grammar_bitmask(self, _output):
+            return None
+
+        def update_from_output(self, scheduler_output, _model_output):
+            assert scheduler_output is output
+            events.append("reconcile")
+            return {}
+
+    class Future:
+        def result(self):
+            events.append("model-result")
+            return object()
+
+    class Executor:
+        def execute_model(self, scheduler_output, *, non_block):
+            assert scheduler_output is output
+            assert non_block is True
+            events.append("execute")
+            return Future()
+
+        def sample_tokens(self, _grammar_output, *, non_block):
+            assert non_block is True
+            return Future()
+
+    monkeypatch.setattr(engine_core, "_SIMFER_SERVICE_TIMING", Recorder())
+    core = SimpleNamespace(
+        batch_queue=deque(maxlen=2),
+        batch_queue_size=2,
+        scheduler=Scheduler(),
+        model_executor=Executor(),
+        is_ec_consumer=True,
+        is_pooling_model=False,
+        check_for_draft_tokens=False,
+        capture_iteration_details=lambda _output: nullcontext(None),
+        log_error_detail=lambda _output: nullcontext(),
+        _process_aborts_queue=lambda: None,
+        _attach_iteration_details=lambda _outputs, _details: None,
+        _should_throttle_prefills=lambda: False,
+    )
+
+    queued_outputs, executed = engine_core.EngineCore.step_with_batch_queue(core)
+    assert queued_outputs is None
+    assert executed is True
+    assert events == ["begin", "schedule", "claim", "execute"]
+    assert core.batch_queue[-1][3] == "queued-selection"
+
+    completed_outputs, executed = engine_core.EngineCore.step_with_batch_queue(core)
+    assert completed_outputs == {}
+    assert executed is False
+    assert events == [
+        "begin",
         "schedule",
         "claim",
         "execute",

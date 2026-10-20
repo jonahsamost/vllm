@@ -75,6 +75,7 @@ from vllm.v1.engine import (
     UtilityResult,
 )
 from vllm.v1.engine.simfer_service_timing import RECORDER as _SIMFER_SERVICE_TIMING
+from vllm.v1.engine.simfer_service_timing import ServiceTimingSelection
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -214,17 +215,19 @@ class EngineCore:
         # to eliminate pipeline bubbles.
         self.batch_queue_size = vllm_config.max_concurrent_batches
         self.batch_queue: (
-            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
+            deque[
+                tuple[
+                    Future[ModelRunnerOutput],
+                    SchedulerOutput,
+                    Future[Any],
+                    ServiceTimingSelection | None,
+                ]
+            ]
+            | None
         ) = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
-        if _SIMFER_SERVICE_TIMING.enabled and self.batch_queue is not None:
-            raise RuntimeError(
-                "SimFer production service timing does not support pipelined "
-                "EngineCore batches"
-            )
-
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
             or vllm_config.ec_transfer_config.is_ec_consumer
@@ -707,8 +710,13 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        deferred_service_selection = None
         if self.scheduler.has_requests():
+            service_started_ns = _SIMFER_SERVICE_TIMING.begin()
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            scheduled_service_selection = _SIMFER_SERVICE_TIMING.claim(
+                scheduler_output, started_ns=service_started_ns
+            )
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -733,10 +741,18 @@ class EngineCore:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
+                    deferred_service_selection = scheduled_service_selection
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
+                batch_queue.appendleft(
+                    (
+                        future,
+                        scheduler_output,
+                        exec_future,
+                        scheduled_service_selection,
+                    )
+                )
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
                 ):
@@ -751,7 +767,7 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
-        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        future, scheduler_output, exec_model_fut, service_selection = batch_queue.pop()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -770,6 +786,7 @@ class EngineCore:
             scheduler_output, model_output
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+        _SIMFER_SERVICE_TIMING.finish(service_selection)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -792,7 +809,14 @@ class EngineCore:
                 deferred_scheduler_output
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+            batch_queue.appendleft(
+                (
+                    future,
+                    deferred_scheduler_output,
+                    exec_future,
+                    deferred_service_selection,
+                )
+            )
 
         return engine_core_outputs, model_executed
 
