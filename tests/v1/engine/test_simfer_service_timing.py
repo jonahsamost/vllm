@@ -105,6 +105,45 @@ def test_iteration_must_emit_exact_selected_shape(tmp_path, monkeypatch) -> None
         recorder.finish_iteration()
 
 
+def test_continuous_selection_skips_and_strides_without_parent_arming(
+    tmp_path, monkeypatch
+) -> None:
+    _configure(tmp_path, monkeypatch)
+    monkeypatch.setenv(
+        "VLLM_SIMFER_SERVICE_TIMING_SELECTION_MODE", "continuous_matches"
+    )
+    monkeypatch.setenv("VLLM_SIMFER_SERVICE_TIMING_SKIP_MATCHES", "2")
+    monkeypatch.setenv("VLLM_SIMFER_SERVICE_TIMING_MATCH_STRIDE", "3")
+    recorder = service_timing.ServiceTimingRecorder()
+
+    selected = []
+    for _index in range(9):
+        selection = recorder.claim(
+            SchedulerOutput(4), started_ns=recorder.begin()
+        )
+        if selection is not None:
+            selected.append(selection)
+
+    assert [item.source_step_index for item in selected] == [2, 5]
+    assert [item.sample_index for item in selected] == [0, 1]
+
+
+def test_continuous_selection_waits_for_parent_ready_file(
+    tmp_path, monkeypatch
+) -> None:
+    _configure(tmp_path, monkeypatch)
+    ready = tmp_path / "ready"
+    monkeypatch.setenv(
+        "VLLM_SIMFER_SERVICE_TIMING_SELECTION_MODE", "continuous_matches"
+    )
+    monkeypatch.setenv("VLLM_SIMFER_SERVICE_TIMING_READY_FILE", str(ready))
+    recorder = service_timing.ServiceTimingRecorder()
+
+    assert recorder.begin() is None
+    ready.touch()
+    assert recorder.begin() is not None
+
+
 def test_engine_core_step_encloses_schedule_execution_and_reconciliation(
     monkeypatch,
 ) -> None:

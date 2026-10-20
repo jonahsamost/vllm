@@ -127,6 +127,9 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        _SIMFER_SERVICE_TIMING.set_participant_rank(
+            vllm_config.parallel_config.data_parallel_rank
+        )
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",

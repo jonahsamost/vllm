@@ -21,6 +21,11 @@ _OUTPUT_ENV = "VLLM_SIMFER_SERVICE_TIMING_DIR"
 _CAPTURE_ID_ENV = "VLLM_SIMFER_SERVICE_TIMING_CAPTURE_ID"
 _TOKEN_COUNTS_ENV = "VLLM_SIMFER_SERVICE_TIMING_TOKEN_COUNTS"
 _MAX_STEPS_ENV = "VLLM_SIMFER_SERVICE_TIMING_MAX_STEPS"
+_SELECTION_MODE_ENV = "VLLM_SIMFER_SERVICE_TIMING_SELECTION_MODE"
+_SKIP_MATCHES_ENV = "VLLM_SIMFER_SERVICE_TIMING_SKIP_MATCHES"
+_MATCH_STRIDE_ENV = "VLLM_SIMFER_SERVICE_TIMING_MATCH_STRIDE"
+_READY_FILE_ENV = "VLLM_SIMFER_SERVICE_TIMING_READY_FILE"
+_CONTINUOUS_SELECTION_MODE = "continuous_matches"
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,8 @@ class ServiceTimingRecorder:
         self._iteration_matches = 0
         self._iteration_skip_matches = 0
         self._token_counts: frozenset[int] = frozenset()
+        self._continuous_matches = 0
+        self._participant_rank: int | None = None
 
     @property
     def enabled(self) -> bool:
@@ -57,13 +64,12 @@ class ServiceTimingRecorder:
                 "separate processes"
             )
         with self._lock:
-            if not self._armed:
+            if not self._armed and not self._continuous_active():
                 return None
         return time.perf_counter_ns()
 
     def arm_iteration(self, *, skip_matches: int) -> None:
         """Select one exact-shape step in the next synthetic iteration."""
-
         if not self.enabled:
             raise RuntimeError("service timing is not enabled")
         if skip_matches < 0:
@@ -79,9 +85,17 @@ class ServiceTimingRecorder:
             self._iteration_skip_matches = skip_matches
             self._token_counts = token_counts
 
+    def set_participant_rank(self, rank: int) -> None:
+        """Bind the owning EngineCore's DP scheduler identity."""
+        if rank < 0:
+            raise ValueError("service-timing participant rank cannot be negative")
+        with self._lock:
+            if self._participant_rank not in {None, rank}:
+                raise RuntimeError("service-timing participant rank changed")
+            self._participant_rank = rank
+
     def finish_iteration(self) -> None:
         """Require the armed iteration to have produced its selected step."""
-
         with self._lock:
             if self._armed:
                 self._armed = False
@@ -99,6 +113,27 @@ class ServiceTimingRecorder:
         with self._lock:
             source_step_index = self._source_steps
             self._source_steps += 1
+            if self._continuous_active():
+                token_counts, maximum, skip_matches, stride = (
+                    _continuous_selection_config()
+                )
+                if scheduled_tokens not in token_counts or self._samples >= maximum:
+                    return None
+                match_index = self._continuous_matches
+                self._continuous_matches += 1
+                if match_index < skip_matches or (
+                    match_index - skip_matches
+                ) % stride:
+                    return None
+                sample_index = self._samples
+                self._samples += 1
+                return ServiceTimingSelection(
+                    sample_index=sample_index,
+                    source_step_index=source_step_index,
+                    started_ns=started_ns,
+                    scheduled_tokens=scheduled_tokens,
+                    scheduled_requests=scheduled_requests,
+                )
             if not self._armed or scheduled_tokens not in self._token_counts:
                 return None
             self._iteration_matches += 1
@@ -115,6 +150,17 @@ class ServiceTimingRecorder:
             scheduled_requests=scheduled_requests,
         )
 
+    @staticmethod
+    def _continuous_enabled() -> bool:
+        return os.environ.get(_SELECTION_MODE_ENV) == _CONTINUOUS_SELECTION_MODE
+
+    @classmethod
+    def _continuous_active(cls) -> bool:
+        if not cls._continuous_enabled():
+            return False
+        ready_file = os.environ.get(_READY_FILE_ENV)
+        return ready_file is None or Path(ready_file).is_file()
+
     def finish(self, selection: ServiceTimingSelection | None) -> None:
         if selection is None:
             return
@@ -126,7 +172,7 @@ class ServiceTimingRecorder:
         if not capture_id:
             raise ValueError(f"{_CAPTURE_ID_ENV} is required")
         root.mkdir(parents=True, exist_ok=True)
-        rank = _rank()
+        rank = self._participant_rank if self._participant_rank is not None else _rank()
         event = {
             "schema_version": 1,
             "kind": "engine_core_step_service_timing",
@@ -176,8 +222,20 @@ def _selection_config() -> tuple[frozenset[int], int]:
     return token_counts, maximum
 
 
+def _continuous_selection_config() -> tuple[frozenset[int], int, int, int]:
+    token_counts, maximum = _selection_config()
+    try:
+        skip_matches = int(os.environ.get(_SKIP_MATCHES_ENV, "0"))
+        stride = int(os.environ.get(_MATCH_STRIDE_ENV, "1"))
+    except ValueError as error:
+        raise ValueError("invalid continuous service-timing selection") from error
+    if skip_matches < 0 or stride <= 0:
+        raise ValueError("invalid continuous service-timing selection bounds")
+    return token_counts, maximum, skip_matches, stride
+
+
 def _rank() -> int:
-    value = int(os.environ.get("RANK", "0"))
+    value = int(os.environ.get("VLLM_DP_RANK", os.environ.get("RANK", "0")))
     if value < 0:
         raise ValueError("service-timing rank cannot be negative")
     return value
