@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 import torch
+
 import vllm.v1.worker.simfer_capture as simfer_capture
 from vllm.utils.simfer_capture import capture_operation_site
-
 from vllm.v1.worker.simfer_capture import (
     OperationCorrelation,
     capture_step,
@@ -17,6 +17,7 @@ from vllm.v1.worker.simfer_capture import (
     record_model_memory,
     record_operation,
     record_phase,
+    record_step_phase,
 )
 
 
@@ -208,7 +209,10 @@ def test_capture_emits_exact_operation_identity_to_stream_and_marker(
         "phase_start",
         "phase_end",
     ]
-    assert operation_events[0]["correlation_id"] == operation_events[1]["correlation_id"]
+    assert (
+        operation_events[0]["correlation_id"]
+        == operation_events[1]["correlation_id"]
+    )
     expected = {
         **binding.to_dict(),
         "semantic_operation_ids": ["semantic:attention:0"],
@@ -249,6 +253,45 @@ def test_operation_range_requires_active_worker_step(tmp_path, monkeypatch) -> N
             resource="gpu:compute",
         ):
             pass
+
+
+def test_step_phase_ignores_capture_lifecycle_work_outside_worker_step(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(tmp_path))
+
+    with record_step_phase("model_forward", resource="gpu") as correlation:
+        assert correlation is None
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_step_phase_records_work_inside_worker_step(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_ID", "capture-step-phase")
+    monkeypatch.setenv("VLLM_SIMFER_VLLM_COMMIT", "a" * 40)
+    monkeypatch.setenv("VLLM_SIMFER_MODEL_CONFIG_SHA256", "b" * 64)
+
+    class SchedulerOutput:
+        total_num_scheduled_tokens = 4
+
+    @capture_step
+    def run_step(_worker, _scheduler_output):
+        with record_step_phase("model_forward", resource="gpu") as correlation:
+            assert correlation is not None
+
+    run_step(None, SchedulerOutput())
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "rank-0.jsonl").read_text().splitlines()
+    ]
+    assert [event["kind"] for event in events] == [
+        "step_start",
+        "phase_start",
+        "phase_end",
+        "step_end",
+    ]
 
 
 def test_bound_operation_claims_exact_plan_entry_and_closes_step(

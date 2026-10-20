@@ -65,7 +65,9 @@ class OperationCorrelation:
             ("semantic operation IDs", self.semantic_operation_ids),
             ("operation dependency IDs", self.dependency_correlation_ids),
         ):
-            if values != tuple(sorted(set(values))) or any(not value for value in values):
+            if values != tuple(sorted(set(values))) or any(
+                not value for value in values
+            ):
                 raise ValueError(f"SimFer {name} must be nonempty canonical strings")
 
     def to_dict(self) -> dict[str, Any]:
@@ -206,6 +208,26 @@ def record_phase(name: str, *, resource: str = "host", **metadata: Any) -> Any:
         raise RuntimeError("SimFer phase range requires an active worker step")
     correlation = _new_correlation_id("phase")
     with _record_range(name, resource, correlation, metadata, None):
+        yield correlation
+
+
+@contextmanager
+def record_step_phase(
+    name: str, *, resource: str = "host", **metadata: Any
+) -> Any:
+    """Record a phase only when execution belongs to a scheduler step.
+
+    Model execution also occurs during initialization, memory profiling,
+    compilation, graph capture, and warmup. Those calls are valid capture
+    lifecycle work but have no scheduler-step parent. Keep them in the
+    enclosing lifecycle timers instead of fabricating a step correlation or
+    weakening ``record_phase``'s fail-closed contract for callers that require
+    an active step.
+    """
+    if not enabled() or _ACTIVE_STEP is None or _ACTIVE_STEP_CORRELATION is None:
+        yield None
+        return
+    with record_phase(name, resource=resource, **metadata) as correlation:
         yield correlation
 
 

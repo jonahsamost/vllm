@@ -1927,7 +1927,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.pre_forward(
                 **connector_kwargs, attn_metadata=attn_metadata
             )
-            with simfer_capture.record_phase("model_forward", resource="gpu"):
+            with simfer_capture.record_step_phase(
+                "model_forward", resource="gpu"
+            ):
                 model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
@@ -1954,7 +1956,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_connector.pre_forward(**connector_kwargs)
                 if ubatch_state is not None:
                     assert self.ubatch_runner is not None
-                    with simfer_capture.record_phase(
+                    with simfer_capture.record_step_phase(
                         "model_forward", resource="gpu"
                     ):
                         model_output = self.ubatch_runner.run(
@@ -1965,7 +1967,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
                     # PIECEWISE after the cudagraph manager exists.
                     assert self.cudagraph_manager is not None
-                    with simfer_capture.record_phase(
+                    with simfer_capture.record_step_phase(
                         "model_forward", resource="gpu"
                     ):
                         model_output = self.cudagraph_manager.run_pw_graph(
@@ -1973,7 +1975,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         )
                 else:
                     # Eager (NONE): call the raw model directly.
-                    with simfer_capture.record_phase(
+                    with simfer_capture.record_step_phase(
                         "model_forward", resource="gpu"
                     ):
                         model_output = self.model(**model_inputs)
