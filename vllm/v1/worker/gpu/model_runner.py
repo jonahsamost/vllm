@@ -2071,7 +2071,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for states in aux_hidden_states
             ]
 
-        with simfer_capture.record_phase("sampling", resource="gpu"):
+        # Sampling is also invoked during engine kernel warmup, before a
+        # scheduler worker-step exists. Keep that lifecycle work under the
+        # enclosing warmup timer; only emit the nested range for real steps.
+        with simfer_capture.record_step_phase("sampling", resource="gpu"):
             sampler_output, num_sampled, num_rejected = self.sample(
                 hidden_states, input_batch, grammar_output
             )
