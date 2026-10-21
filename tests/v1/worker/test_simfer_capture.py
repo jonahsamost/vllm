@@ -84,6 +84,15 @@ def test_shared_linear_boundaries_publish_stable_simfer_site_metadata() -> None:
         assert linear_type.forward.__simfer_operation_name__ == "linear"
 
 
+def test_triton_experts_publish_stable_simfer_site_metadata() -> None:
+    from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+
+    assert (
+        TritonExperts.apply.__simfer_instrumentation_site__ == "provider.triton.experts"
+    )
+    assert TritonExperts.apply.__simfer_operation_name__ == "triton_experts"
+
+
 def test_graph_provenance_excludes_unrelated_branch() -> None:
     nodes = [
         {"index": 0, "dependencies": []},
@@ -153,6 +162,55 @@ def test_operation_decorator_inserts_boundaries_during_compilation(
     assert calls[1] == ("operation", value)
     assert calls[2][0:2] == ("end", boundary)
     assert torch.equal(calls[2][2], result)
+
+
+def test_operation_decorator_uses_named_in_place_output_during_compilation(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_SIMFER_GRAPH_PROVENANCE", "1")
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    calls: list[tuple[Any, ...]] = []
+    boundary = object()
+
+    def begin(site, anchor):
+        calls.append(("begin", site, anchor))
+        return boundary
+
+    def end(value, anchor):
+        calls.append(("end", value, anchor))
+
+    monkeypatch.setattr(graph_provenance, "begin_compiled_operation", begin)
+    monkeypatch.setattr(graph_provenance, "end_compiled_operation", end)
+
+    @capture_operation_site(
+        "provider.triton.experts",
+        "triton_experts",
+        output_parameter="output",
+    )
+    def apply(*, output, value):
+        output.copy_(value)
+
+    output = torch.zeros(1)
+    value = torch.ones(1)
+    result = apply(output=output, value=value)
+
+    assert result is None
+    assert calls[0] == ("begin", "provider.triton.experts", output)
+    assert calls[1] == ("end", boundary, output)
+    assert torch.equal(output, value)
+
+
+def test_operation_decorator_rejects_unknown_output_parameter() -> None:
+    with pytest.raises(ValueError, match="output parameter 'missing'"):
+
+        @capture_operation_site(
+            "provider.triton.experts",
+            "triton_experts",
+            output_parameter="missing",
+        )
+        def apply(output):
+            return output
 
 
 def test_operation_decorator_coalesces_nested_compiled_same_site(

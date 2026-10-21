@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable
 from functools import wraps
+from inspect import Signature, signature
 from typing import Any, Protocol, cast
 
 import torch
@@ -50,12 +51,28 @@ def capture_operation_site(
     resource: str = "gpu",
     compile_boundary: bool = True,
     eager_range: bool = True,
+    output_parameter: str | None = None,
 ) -> Any:
-    """Decorate an exact operation boundary with a frozen SimFer binding."""
+    """Decorate an exact operation boundary with a frozen SimFer binding.
+
+    ``output_parameter`` names an in-place output when the callable returns no
+    tensor. The tensor supplies the dependency anchor for the closing compiled
+    boundary; it does not alter the callable's return contract.
+    """
     if not instrumentation_site or not name or not resource:
         raise ValueError("SimFer operation-site decorator arguments cannot be empty")
 
     def decorate(function: Any) -> Any:
+        function_signature = signature(function)
+        if (
+            output_parameter is not None
+            and output_parameter not in function_signature.parameters
+        ):
+            raise ValueError(
+                f"SimFer output parameter {output_parameter!r} is not in "
+                f"{function.__qualname__}"
+            )
+
         @wraps(function)
         def wrapped(*args: Any, **kwargs: Any) -> Any:
             if not os.environ.get("VLLM_SIMFER_CAPTURE_DIR"):
@@ -84,7 +101,16 @@ def capture_operation_site(
                         instrumentation_site, _first_tensor((args, kwargs))
                     )
                     result = function(*args, **kwargs)
-                    end_compiled_operation(boundary, _first_tensor(result))
+                    end_compiled_operation(
+                        boundary,
+                        _output_tensor(
+                            function_signature,
+                            output_parameter,
+                            args,
+                            kwargs,
+                            result,
+                        ),
+                    )
                     return result
 
             from vllm.v1.worker.simfer_graph_provenance import operation_scope
@@ -109,6 +135,19 @@ def capture_operation_site(
         return instrumented
 
     return decorate
+
+
+def _output_tensor(
+    function_signature: Signature,
+    output_parameter: str | None,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> torch.Tensor:
+    if output_parameter is None:
+        return _first_tensor(result)
+    argument = function_signature.bind(*args, **kwargs).arguments[output_parameter]
+    return _first_tensor(argument)
 
 
 __all__ = ["capture_operation_site"]

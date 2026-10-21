@@ -60,6 +60,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.utils.simfer_capture import capture_operation_site
 
 
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
@@ -240,6 +241,11 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         output = (M, K)
         return (workspace1, workspace2, output)
 
+    @capture_operation_site(
+        "provider.triton.experts",
+        "triton_experts",
+        output_parameter="output",
+    )
     def apply(
         self,
         output: torch.Tensor,
