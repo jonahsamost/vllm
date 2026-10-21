@@ -22,8 +22,11 @@ _ENABLED_ENV = "VLLM_SIMFER_GRAPH_PROVENANCE"
 _ACTIVE = threading.local()
 _LOCK = threading.Lock()
 _NEXT_GRAPH = 0
+_NEXT_EVENT = 0
 _SITE_OCCURRENCES: dict[tuple[int, str], int] = {}
 _CAPTURED_BINDINGS: set[tuple[int, int, str, int]] = set()
+_COMPILED_BOUNDARIES: list[_OperationBoundary] = []
+_COMPILED_EVENTS: dict[int, torch.cuda.Event] = {}
 
 
 def enabled() -> bool:
@@ -34,8 +37,22 @@ def enabled() -> bool:
 class _OperationBoundary:
     correlation_id: str
     operation_correlation: dict[str, Any]
+    coordinate: tuple[int, int, str, int]
     begin: torch.cuda.Event
     end: torch.cuda.Event
+
+
+@torch.library.custom_op(
+    "vllm::simfer_record_external_event", mutates_args=("anchor",)
+)
+def _record_external_event(anchor: torch.Tensor, token: int) -> None:
+    """Record an external event from an opaque compiled-graph operation."""
+    _COMPILED_EVENTS[token].record()
+
+
+@_record_external_event.register_fake
+def _record_external_event_fake(anchor: torch.Tensor, token: int) -> None:
+    return None
 
 
 @dataclass
@@ -48,8 +65,6 @@ class GraphCapture:
 
     def finish(self) -> None:
         self.graph.instantiate()
-        if not self.operations:
-            return
         graph_data = self.graph.get_graph_data()
         nodes = graph_data.get("nodes")
         if not isinstance(nodes, list) or not nodes:
@@ -58,8 +73,11 @@ class GraphCapture:
         if len(raw_nodes) != len(nodes):
             raise RuntimeError("SimFer CUDA graph metadata node counts disagree")
         event_nodes = _event_node_indices(raw_nodes)
+        operations = [*self.operations, *_compiled_operations(event_nodes)]
+        if not operations:
+            return
         ownership: dict[int, _OperationBoundary] = {}
-        for operation in self.operations:
+        for operation in operations:
             begin = event_nodes.get(operation.begin.cuda_event)
             end = event_nodes.get(operation.end.cuda_event)
             if begin is None or end is None:
@@ -75,6 +93,7 @@ class GraphCapture:
                 prior = ownership.setdefault(index, operation)
                 if prior.correlation_id != operation.correlation_id:
                     raise RuntimeError("SimFer CUDA graph operation scopes overlap")
+            _CAPTURED_BINDINGS.add(operation.coordinate)
 
         from vllm.v1.worker.simfer_capture import record_event
 
@@ -132,20 +151,70 @@ def operation_scope(instrumentation_site: str) -> Iterator[bool]:
     if capture is None:
         yield False
         return
-    correlation_id, operation_correlation, coordinate = _graph_binding(
-        instrumentation_site
-    )
-    begin = torch.cuda.Event(enable_timing=False, external=True)
-    end = torch.cuda.Event(enable_timing=False, external=True)
-    begin.record()
+    active_sites = getattr(_ACTIVE, "operation_sites", set())
+    if instrumentation_site in active_sites:
+        yield True
+        return
+    boundary = _new_operation_boundary(instrumentation_site)
+    _ACTIVE.operation_sites = {*active_sites, instrumentation_site}
+    boundary.begin.record()
     try:
         yield True
     finally:
-        end.record()
-        capture.operations.append(
-            _OperationBoundary(correlation_id, operation_correlation, begin, end)
-        )
-        _CAPTURED_BINDINGS.add(coordinate)
+        boundary.end.record()
+        capture.operations.append(boundary)
+        _ACTIVE.operation_sites = active_sites
+
+
+def begin_compiled_operation(
+    instrumentation_site: str, anchor: torch.Tensor
+) -> _OperationBoundary:
+    """Insert a begin marker that survives Dynamo/Inductor compilation."""
+    boundary = _new_operation_boundary(instrumentation_site)
+    _record_external_event(anchor, _register_event(boundary.begin))
+    _COMPILED_BOUNDARIES.append(boundary)
+    return boundary
+
+
+def end_compiled_operation(
+    boundary: _OperationBoundary, anchor: torch.Tensor
+) -> None:
+    """Insert the matching compiled end marker after the operation output."""
+    _record_external_event(anchor, _register_event(boundary.end))
+
+
+def _new_operation_boundary(instrumentation_site: str) -> _OperationBoundary:
+    correlation_id, operation_correlation, coordinate = _graph_binding(
+        instrumentation_site
+    )
+    return _OperationBoundary(
+        correlation_id=correlation_id,
+        operation_correlation=operation_correlation,
+        coordinate=coordinate,
+        begin=torch.cuda.Event(enable_timing=False, external=True),
+        end=torch.cuda.Event(enable_timing=False, external=True),
+    )
+
+
+def _register_event(event: torch.cuda.Event) -> int:
+    global _NEXT_EVENT
+    with _LOCK:
+        token = _NEXT_EVENT
+        _NEXT_EVENT += 1
+        _COMPILED_EVENTS[token] = event
+    return token
+
+
+def _compiled_operations(event_nodes: dict[int, int]) -> list[_OperationBoundary]:
+    operations = []
+    for operation in _COMPILED_BOUNDARIES:
+        begin = operation.begin.cuda_event in event_nodes
+        end = operation.end.cuda_event in event_nodes
+        if begin != end:
+            raise RuntimeError("SimFer compiled operation boundary is incomplete")
+        if begin:
+            operations.append(operation)
+    return operations
 
 
 def bindings_covered(rank: int, step_index: int) -> bool:
@@ -278,4 +347,11 @@ def _rank() -> int:
     return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
 
 
-__all__ = ["bindings_covered", "capture_graph", "enabled", "operation_scope"]
+__all__ = [
+    "begin_compiled_operation",
+    "bindings_covered",
+    "capture_graph",
+    "enabled",
+    "end_compiled_operation",
+    "operation_scope",
+]

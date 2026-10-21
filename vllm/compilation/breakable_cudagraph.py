@@ -119,6 +119,21 @@ def eager_break_during_capture(fn: F) -> F:
     return wrapper  # type: ignore[return-value]
 
 
+def _operation_replay_scope(
+    fn: Callable[[], Any], instrumentation_site: str
+) -> Callable[[], Any]:
+    """Restore an operation scope when a stored eager segment is replayed."""
+
+    @functools.wraps(fn)
+    def replay() -> Any:
+        from vllm.v1.worker.simfer_graph_provenance import operation_scope
+
+        with operation_scope(instrumentation_site):
+            return fn()
+
+    return replay
+
+
 # ---------------------------------------------------------------------------
 # Capture context
 # ---------------------------------------------------------------------------
@@ -156,6 +171,8 @@ class BreakableCUDAGraphCapture:
         self._num_eager_breaks: int = 0
         self._current_graph: torch.cuda.CUDAGraph | None = None
         self._capturing: bool = False
+        self._collecting_eager_operation: bool = False
+        self._eager_operation_site: str | None = None
 
     # --- context manager protocol ----------------------------------------
 
@@ -203,11 +220,27 @@ class BreakableCUDAGraphCapture:
         downstream dependencies via static output buffers.
         """
         self._end_segment()
-        result = fn()
-        self.segments.append(fn)
+        self._collecting_eager_operation = True
+        self._eager_operation_site = None
+        try:
+            result = fn()
+        finally:
+            self._collecting_eager_operation = False
+        replay = fn
+        if self._eager_operation_site is not None:
+            replay = _operation_replay_scope(fn, self._eager_operation_site)
+        self.segments.append(replay)
         self._num_eager_breaks += 1
         self._begin_segment()
         return result
+
+    def bind_eager_operation(self, instrumentation_site: str) -> None:
+        """Associate the eager segment under construction with one operation."""
+        if not self._collecting_eager_operation:
+            raise RuntimeError("no breakable eager segment is being constructed")
+        if self._eager_operation_site not in {None, instrumentation_site}:
+            raise RuntimeError("breakable eager segment spans multiple operations")
+        self._eager_operation_site = instrumentation_site
 
     # --- replay ----------------------------------------------------------
 

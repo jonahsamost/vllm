@@ -74,6 +74,115 @@ def test_graph_provenance_excludes_unrelated_branch() -> None:
     assert graph_provenance._nodes_between(nodes, 1, 4) == {2}
 
 
+def test_operation_decorator_inserts_boundaries_during_compilation(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_SIMFER_GRAPH_PROVENANCE", "1")
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    calls = []
+    boundary = object()
+
+    def begin(site, anchor):
+        calls.append(("begin", site, anchor))
+        return boundary
+
+    def end(value, anchor):
+        calls.append(("end", value, anchor))
+
+    monkeypatch.setattr(graph_provenance, "begin_compiled_operation", begin)
+    monkeypatch.setattr(graph_provenance, "end_compiled_operation", end)
+
+    @capture_operation_site("glm.kda", "kda")
+    def kda(value):
+        calls.append(("operation", value))
+        return value + 1
+
+    value = torch.ones(1)
+    result = kda(value)
+
+    assert torch.equal(result, torch.full((1,), 2.0))
+    assert calls[0] == ("begin", "glm.kda", value)
+    assert calls[1] == ("operation", value)
+    assert calls[2][0:2] == ("end", boundary)
+    assert torch.equal(calls[2][2], result)
+
+
+def test_compiled_boundaries_require_both_event_nodes(monkeypatch) -> None:
+    begin = type("Event", (), {"cuda_event": 10})()
+    end = type("Event", (), {"cuda_event": 20})()
+    boundary = graph_provenance._OperationBoundary(
+        correlation_id="correlation",
+        operation_correlation={},
+        coordinate=(0, 0, "glm.kda", 0),
+        begin=begin,
+        end=end,
+    )
+    monkeypatch.setattr(graph_provenance, "_COMPILED_BOUNDARIES", [boundary])
+
+    assert graph_provenance._compiled_operations({10: 1, 20: 3}) == [boundary]
+    with pytest.raises(RuntimeError, match="boundary is incomplete"):
+        graph_provenance._compiled_operations({10: 1})
+
+
+def test_graph_provenance_coalesces_nested_same_site(monkeypatch) -> None:
+    recorded = []
+    event = type("Event", (), {"record": lambda self: recorded.append(self)})
+    boundary = graph_provenance._OperationBoundary(
+        correlation_id="correlation",
+        operation_correlation={},
+        coordinate=(0, 0, "glm.kda", 0),
+        begin=event(),
+        end=event(),
+    )
+    capture = type("Capture", (), {"operations": []})()
+    monkeypatch.setattr(graph_provenance._ACTIVE, "capture", capture, raising=False)
+    monkeypatch.setattr(
+        graph_provenance, "_new_operation_boundary", lambda _site: boundary
+    )
+
+    with graph_provenance.operation_scope("glm.kda") as outer:
+        with graph_provenance.operation_scope("glm.kda") as inner:
+            assert outer and inner
+
+    assert recorded == [boundary.begin, boundary.end]
+    assert capture.operations == [boundary]
+
+
+def test_breakable_eager_segment_restores_operation_scope_on_replay(
+    monkeypatch,
+) -> None:
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    capture = BreakableCUDAGraphCapture()
+    monkeypatch.setattr(capture, "_end_segment", lambda: None)
+    monkeypatch.setattr(capture, "_begin_segment", lambda: None)
+    scopes = []
+    calls = []
+
+    @contextmanager
+    def operation_scope(site):
+        scopes.append(("begin", site))
+        try:
+            yield True
+        finally:
+            scopes.append(("end", site))
+
+    monkeypatch.setattr(graph_provenance, "operation_scope", operation_scope)
+
+    def operation():
+        if capture._collecting_eager_operation:
+            capture.bind_eager_operation("glm.kda")
+        calls.append("operation")
+        return "done"
+
+    assert capture.add_eager(operation) == "done"
+    assert calls == ["operation"]
+    capture.segments[0]()
+    assert calls == ["operation", "operation"]
+    assert scopes == [("begin", "glm.kda"), ("end", "glm.kda")]
+
+
 def _enable_fake_profile(tmp_path: Path, monkeypatch) -> None:
     class FakeProfiler:
         def __enter__(self):

@@ -92,6 +92,9 @@ def _kpool_compress_insert(
 
 
 @eager_break_during_capture
+@capture_operation_site(
+    "glm.sparse_indexer", "glm_sparse_indexer", compile_boundary=False
+)
 def sparse_attn_indexer_kpool(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -701,7 +704,9 @@ class SparseAttnIndexerKpool(CustomOp):
             positions=positions,
         )
 
-    @capture_operation_site("glm.sparse_indexer", "glm_sparse_indexer")
+    @capture_operation_site(
+        "glm.sparse_indexer", "glm_sparse_indexer", eager_range=False
+    )
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
