@@ -32,7 +32,8 @@ def enabled() -> bool:
 
 @dataclass
 class _OperationBoundary:
-    binding: dict[str, Any]
+    correlation_id: str
+    operation_correlation: dict[str, Any]
     begin: torch.cuda.Event
     end: torch.cuda.Event
 
@@ -57,7 +58,7 @@ class GraphCapture:
         if len(raw_nodes) != len(nodes):
             raise RuntimeError("SimFer CUDA graph metadata node counts disagree")
         event_nodes = _event_node_indices(raw_nodes)
-        ownership: dict[int, dict[str, Any]] = {}
+        ownership: dict[int, _OperationBoundary] = {}
         for operation in self.operations:
             begin = event_nodes.get(operation.begin.cuda_event)
             end = event_nodes.get(operation.end.cuda_event)
@@ -66,8 +67,8 @@ class GraphCapture:
                     "SimFer operation boundary event is absent from graph"
                 )
             for index in _nodes_between(nodes, begin, end):
-                prior = ownership.setdefault(index, operation.binding)
-                if prior != operation.binding:
+                prior = ownership.setdefault(index, operation)
+                if prior.correlation_id != operation.correlation_id:
                     raise RuntimeError("SimFer CUDA graph operation scopes overlap")
 
         from vllm.v1.worker.simfer_capture import record_event
@@ -79,14 +80,7 @@ class GraphCapture:
             batch_descriptor=self.batch_descriptor,
             exec_graph_id=graph_data.get("exec_graph_id"),
             nodes=tuple(
-                {
-                    "index": item["index"],
-                    "node_type": item["node_type"],
-                    "graph_id": item["graph_id"],
-                    "graph_node_id": item["node_id"],
-                    "dependencies": tuple(item["dependencies"]),
-                    "operation_correlation": ownership.get(item["index"]),
-                }
+                _node_record(item, ownership.get(item["index"]))
                 for item in nodes
             ),
         )
@@ -133,7 +127,9 @@ def operation_scope(instrumentation_site: str) -> Iterator[bool]:
     if capture is None:
         yield False
         return
-    binding, coordinate = _graph_binding(instrumentation_site)
+    correlation_id, operation_correlation, coordinate = _graph_binding(
+        instrumentation_site
+    )
     begin = torch.cuda.Event(enable_timing=False, external=True)
     end = torch.cuda.Event(enable_timing=False, external=True)
     begin.record()
@@ -141,25 +137,32 @@ def operation_scope(instrumentation_site: str) -> Iterator[bool]:
         yield True
     finally:
         end.record()
-        capture.operations.append(_OperationBoundary(binding, begin, end))
+        capture.operations.append(
+            _OperationBoundary(correlation_id, operation_correlation, begin, end)
+        )
         _CAPTURED_BINDINGS.add(coordinate)
 
 
 def bindings_covered(rank: int, step_index: int) -> bool:
     """Return whether capture observed every planned binding for a step."""
-    from vllm.v1.worker.simfer_capture import operation_plan_coordinates
+    from vllm.v1.worker.simfer_capture import graph_operation_plan
 
-    expected = operation_plan_coordinates(rank, step_index)
+    expected = {key for key, _item in graph_operation_plan(rank, step_index)}
     return bool(expected) and expected.issubset(_CAPTURED_BINDINGS)
 
 
 def _graph_binding(
     instrumentation_site: str,
-) -> tuple[dict[str, Any], tuple[int, int, str, int]]:
-    from vllm.v1.worker.simfer_capture import graph_operation_bindings
+) -> tuple[str, dict[str, Any], tuple[int, int, str, int]]:
+    from vllm.v1.worker.simfer_capture import graph_operation_plan
 
     rank = _rank()
-    bindings = graph_operation_bindings(rank, instrumentation_site)
+    step_index = int(os.environ.get("VLLM_SIMFER_OPERATION_STEP_INDEX", "0"))
+    bindings = tuple(
+        (key, item)
+        for key, item in graph_operation_plan(rank, step_index)
+        if key[2] == instrumentation_site
+    )
     if not bindings:
         raise RuntimeError(
             "SimFer graph provenance has no binding for "
@@ -168,8 +171,15 @@ def _graph_binding(
     key = (rank, instrumentation_site)
     occurrence = _SITE_OCCURRENCES.get(key, 0) % len(bindings)
     _SITE_OCCURRENCES[key] = _SITE_OCCURRENCES.get(key, 0) + 1
-    coordinate, binding = bindings[occurrence]
-    return binding, coordinate
+    coordinate, item = bindings[occurrence]
+    operation_correlation = {
+        "schema_version": 1,
+        "physical_operation_id": item["physical_operation_id"],
+        "semantic_operation_ids": tuple(item["semantic_operation_ids"]),
+        "timing_key_id": item["timing_key_id"],
+        "dependency_correlation_ids": tuple(item["dependency_correlation_ids"]),
+    }
+    return item["correlation_id"], operation_correlation, coordinate
 
 
 def _raw_graph_nodes(graph: torch.cuda.CUDAGraph) -> list[Any]:
@@ -213,6 +223,22 @@ def _nodes_between(nodes: list[dict[str, Any]], begin: int, end: int) -> set[int
     after_begin = _reachable(dependents, begin)
     before_end = _reachable(dependencies, end)
     return (after_begin & before_end) - {begin, end}
+
+
+def _node_record(
+    node: dict[str, Any], operation: _OperationBoundary | None
+) -> dict[str, Any]:
+    return {
+        "index": node["index"],
+        "node_type": node["node_type"],
+        "graph_id": node["graph_id"],
+        "graph_node_id": node["node_id"],
+        "dependencies": tuple(node["dependencies"]),
+        "correlation_id": None if operation is None else operation.correlation_id,
+        "operation_correlation": (
+            None if operation is None else operation.operation_correlation
+        ),
+    }
 
 
 def _reachable(edges: dict[int, set[int]], start: int) -> set[int]:
