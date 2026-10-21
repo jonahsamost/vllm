@@ -66,15 +66,19 @@ def capture_operation_site(
             if compile_boundary and enabled() and compiling:
                 from vllm.v1.worker.simfer_graph_provenance import (
                     begin_compiled_operation,
+                    compiled_operation_scope,
                     end_compiled_operation,
                 )
 
-                boundary = begin_compiled_operation(
-                    instrumentation_site, _first_tensor((args, kwargs))
-                )
-                result = function(*args, **kwargs)
-                end_compiled_operation(boundary, _first_tensor(result))
-                return result
+                with compiled_operation_scope(instrumentation_site) as publish:
+                    if not publish:
+                        return function(*args, **kwargs)
+                    boundary = begin_compiled_operation(
+                        instrumentation_site, _first_tensor((args, kwargs))
+                    )
+                    result = function(*args, **kwargs)
+                    end_compiled_operation(boundary, _first_tensor(result))
+                    return result
 
             from vllm.v1.worker.simfer_graph_provenance import operation_scope
 

@@ -67,13 +67,19 @@ def test_graph_provenance_selects_nodes_between_event_boundaries() -> None:
 
 
 def test_shared_linear_boundaries_publish_stable_simfer_site_metadata() -> None:
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
     from vllm.model_executor.layers.linear import (
         ColumnParallelLinear,
         ReplicatedLinear,
         RowParallelLinear,
     )
 
-    for linear_type in (ReplicatedLinear, ColumnParallelLinear, RowParallelLinear):
+    for linear_type in (
+        ReplicatedLinear,
+        ColumnParallelLinear,
+        RowParallelLinear,
+        GateLinear,
+    ):
         assert linear_type.forward.__simfer_instrumentation_site__ == "physical.linear"
         assert linear_type.forward.__simfer_operation_name__ == "linear"
 
@@ -147,6 +153,42 @@ def test_operation_decorator_inserts_boundaries_during_compilation(
     assert calls[1] == ("operation", value)
     assert calls[2][0:2] == ("end", boundary)
     assert torch.equal(calls[2][2], result)
+
+
+def test_operation_decorator_coalesces_nested_compiled_same_site(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_SIMFER_GRAPH_PROVENANCE", "1")
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    calls: list[tuple[Any, ...]] = []
+    boundary = object()
+
+    def begin(site, anchor):
+        calls.append(("begin", site, anchor))
+        return boundary
+
+    def end(value, anchor):
+        calls.append(("end", value, anchor))
+
+    monkeypatch.setattr(graph_provenance, "begin_compiled_operation", begin)
+    monkeypatch.setattr(graph_provenance, "end_compiled_operation", end)
+
+    @capture_operation_site("physical.linear", "linear")
+    def inner(value):
+        calls.append(("inner", value))
+        return value + 1
+
+    @capture_operation_site("physical.linear", "linear")
+    def outer(value):
+        calls.append(("outer", value))
+        return inner(value)
+
+    value = torch.ones(1)
+    result = outer(value)
+
+    assert torch.equal(result, torch.full((1,), 2.0))
+    assert [call[0] for call in calls] == ["begin", "outer", "inner", "end"]
 
 
 def test_compiled_boundaries_require_both_event_nodes(monkeypatch) -> None:

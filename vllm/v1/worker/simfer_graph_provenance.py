@@ -204,6 +204,20 @@ def operation_scope(instrumentation_site: str) -> Iterator[bool]:
         _ACTIVE.operation_sites = active_sites
 
 
+@contextmanager
+def compiled_operation_scope(instrumentation_site: str) -> Iterator[bool]:
+    """Coalesce nested compiled boundaries published by an overriding layer."""
+    active_sites: set[str] = getattr(_ACTIVE, "compiled_operation_sites", set())
+    if instrumentation_site in active_sites:
+        yield False
+        return
+    _ACTIVE.compiled_operation_sites = {*active_sites, instrumentation_site}
+    try:
+        yield True
+    finally:
+        _ACTIVE.compiled_operation_sites = active_sites
+
+
 def begin_compiled_operation(
     instrumentation_site: str, anchor: torch.Tensor
 ) -> _OperationBoundary:
@@ -390,6 +404,7 @@ __all__ = [
     "begin_compiled_operation",
     "bindings_covered",
     "capture_graph",
+    "compiled_operation_scope",
     "debug_operation_site",
     "enabled",
     "end_compiled_operation",

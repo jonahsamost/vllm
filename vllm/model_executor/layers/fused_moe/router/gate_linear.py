@@ -7,6 +7,7 @@ import vllm._custom_ops as ops
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.platforms import current_platform
+from vllm.utils.simfer_capture import capture_operation_site
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
@@ -162,6 +163,7 @@ class GateLinear(ReplicatedLinear):
                 and is_available()
             )
 
+    @capture_operation_site("physical.linear", "linear")
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
