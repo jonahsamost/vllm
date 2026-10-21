@@ -42,7 +42,6 @@ def capture_operation_site(
     eager_range: bool = True,
 ) -> Any:
     """Decorate an exact operation boundary with a frozen SimFer binding."""
-
     if not instrumentation_site or not name or not resource:
         raise ValueError("SimFer operation-site decorator arguments cannot be empty")
 
@@ -53,19 +52,15 @@ def capture_operation_site(
                 return function(*args, **kwargs)
             from vllm.v1.worker.simfer_graph_provenance import enabled
 
-            if enabled():
-                from vllm.compilation.breakable_cudagraph import (
-                    BreakableCUDAGraphCapture,
+            compiling = torch.compiler.is_compiling()
+            if os.environ.get("VLLM_SIMFER_DEBUG_PROVENANCE"):
+                from vllm.v1.worker.simfer_graph_provenance import (
+                    debug_operation_site,
                 )
 
-                breakable_capture = BreakableCUDAGraphCapture.current()
-                if (
-                    breakable_capture is not None
-                    and not breakable_capture._capturing
-                ):
-                    breakable_capture.bind_eager_operation(instrumentation_site)
+                debug_operation_site(instrumentation_site, name, compiling=compiling)
 
-            if compile_boundary and enabled() and torch.compiler.is_compiling():
+            if compile_boundary and enabled() and compiling:
                 from vllm.v1.worker.simfer_graph_provenance import (
                     begin_compiled_operation,
                     end_compiled_operation,

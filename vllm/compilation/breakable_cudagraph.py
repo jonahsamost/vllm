@@ -28,6 +28,7 @@ import gc
 import threading
 import weakref
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import Any, ClassVar, TypeVar
 
 import torch
@@ -61,6 +62,21 @@ def _weak_ref_capture_arg(arg: Any) -> Any:
     if isinstance(arg, QuantizedActivation):
         return arg.weak_ref()
     return weak_ref_tensor(arg)
+
+
+def _provenance_replay(
+    replay: Callable[[], Any], graph_instance_id: str
+) -> Callable[[], Any]:
+    """Emit the stable graph identity around a breakable segment replay."""
+
+    @functools.wraps(replay)
+    def wrapped() -> Any:
+        from vllm.v1.worker.simfer_capture import record_cuda_graph_replay
+
+        with record_cuda_graph_replay(graph_instance_id):
+            return replay()
+
+    return wrapped
 
 
 def eager_break_during_capture(fn: F) -> F:
@@ -119,21 +135,6 @@ def eager_break_during_capture(fn: F) -> F:
     return wrapper  # type: ignore[return-value]
 
 
-def _operation_replay_scope(
-    fn: Callable[[], Any], instrumentation_site: str
-) -> Callable[[], Any]:
-    """Restore an operation scope when a stored eager segment is replayed."""
-
-    @functools.wraps(fn)
-    def replay() -> Any:
-        from vllm.v1.worker.simfer_graph_provenance import operation_scope
-
-        with operation_scope(instrumentation_site):
-            return fn()
-
-    return replay
-
-
 # ---------------------------------------------------------------------------
 # Capture context
 # ---------------------------------------------------------------------------
@@ -164,15 +165,22 @@ class BreakableCUDAGraphCapture:
     def is_active(cls) -> bool:
         return cls.current() is not None
 
-    def __init__(self, pool: Any | None = None) -> None:
+    def __init__(
+        self,
+        pool: Any | None = None,
+        runtime_mode: CUDAGraphMode | None = None,
+        batch_descriptor: BatchDescriptor | None = None,
+    ) -> None:
         self.pool = pool
+        self.runtime_mode = runtime_mode
+        self.batch_descriptor = batch_descriptor
         self.segments: list[Callable[[], Any]] = []
         self._num_graphs: int = 0
         self._num_eager_breaks: int = 0
         self._current_graph: torch.cuda.CUDAGraph | None = None
         self._capturing: bool = False
-        self._collecting_eager_operation: bool = False
-        self._eager_operation_site: str | None = None
+        self._provenance_context: Any | None = None
+        self._provenance_capture: Any | None = None
 
     # --- context manager protocol ----------------------------------------
 
@@ -193,22 +201,63 @@ class BreakableCUDAGraphCapture:
 
     def _begin_segment(self) -> None:
         assert not self._capturing
-        g = torch.cuda.CUDAGraph()
-        if self.pool is not None:
-            g.capture_begin(pool=self.pool)
-        else:
-            g.capture_begin()
+        from vllm.v1.worker.simfer_graph_provenance import (
+            capture_graph as simfer_capture_graph,
+        )
+        from vllm.v1.worker.simfer_graph_provenance import (
+            enabled as simfer_graph_provenance_enabled,
+        )
+
+        provenance_enabled = (
+            simfer_graph_provenance_enabled()
+            and self.runtime_mode == CUDAGraphMode.FULL
+        )
+        g = torch.cuda.CUDAGraph(keep_graph=provenance_enabled)
+        provenance_context = (
+            simfer_capture_graph(
+                g,
+                runtime_mode=self.runtime_mode,
+                batch_descriptor=self.batch_descriptor,
+            )
+            if provenance_enabled
+            else nullcontext(None)
+        )
+        provenance_capture = provenance_context.__enter__()
+        try:
+            if self.pool is not None:
+                g.capture_begin(pool=self.pool)
+            else:
+                g.capture_begin()
+        except BaseException as exc:
+            provenance_context.__exit__(type(exc), exc, exc.__traceback__)
+            raise
         self._current_graph = g
+        self._provenance_context = provenance_context
+        self._provenance_capture = provenance_capture
         self._capturing = True
 
     def _end_segment(self) -> None:
         if not self._capturing:
             return
         assert self._current_graph is not None
-        self._current_graph.capture_end()
-        self.segments.append(self._current_graph.replay)
+        assert self._provenance_context is not None
+        try:
+            self._current_graph.capture_end()
+        except BaseException as exc:
+            self._provenance_context.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        else:
+            self._provenance_context.__exit__(None, None, None)
+        replay = self._current_graph.replay
+        if self._provenance_capture is not None:
+            replay = _provenance_replay(
+                replay, self._provenance_capture.graph_instance_id
+            )
+        self.segments.append(replay)
         self._num_graphs += 1
         self._current_graph = None
+        self._provenance_context = None
+        self._provenance_capture = None
         self._capturing = False
 
     def add_eager(self, fn: Callable[[], Any]) -> Any:
@@ -220,27 +269,11 @@ class BreakableCUDAGraphCapture:
         downstream dependencies via static output buffers.
         """
         self._end_segment()
-        self._collecting_eager_operation = True
-        self._eager_operation_site = None
-        try:
-            result = fn()
-        finally:
-            self._collecting_eager_operation = False
-        replay = fn
-        if self._eager_operation_site is not None:
-            replay = _operation_replay_scope(fn, self._eager_operation_site)
-        self.segments.append(replay)
+        result = fn()
+        self.segments.append(fn)
         self._num_eager_breaks += 1
         self._begin_segment()
         return result
-
-    def bind_eager_operation(self, instrumentation_site: str) -> None:
-        """Associate the eager segment under construction with one operation."""
-        if not self._collecting_eager_operation:
-            raise RuntimeError("no breakable eager segment is being constructed")
-        if self._eager_operation_site not in {None, instrumentation_site}:
-            raise RuntimeError("breakable eager segment spans multiple operations")
-        self._eager_operation_site = instrumentation_site
 
     # --- replay ----------------------------------------------------------
 
@@ -418,7 +451,11 @@ class BreakableCUDAGraphWrapper:
         # pre-capture prefetches are complete and don't leak into the graph.
         get_offloader().sync_prev_onload()
 
-        capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
+        capture = BreakableCUDAGraphCapture(
+            pool=self.graph_pool,
+            runtime_mode=get_forward_context().cudagraph_runtime_mode,
+            batch_descriptor=entry.batch_descriptor,
+        )
         with capture:
             output = self.runnable(*args, **kwargs)
             # Join the offloader's copy stream while we still hold the last

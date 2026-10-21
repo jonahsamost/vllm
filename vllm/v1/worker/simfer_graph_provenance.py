@@ -9,6 +9,7 @@ Python operation hooks and introduces no marker kernels.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from collections.abc import Iterator
@@ -27,10 +28,33 @@ _SITE_OCCURRENCES: dict[tuple[int, str], int] = {}
 _CAPTURED_BINDINGS: set[tuple[int, int, str, int]] = set()
 _COMPILED_BOUNDARIES: list[_OperationBoundary] = []
 _COMPILED_EVENTS: dict[int, torch.cuda.Event] = {}
+_DEBUG_STATES: set[tuple[str, str, bool, bool]] = set()
+logger = logging.getLogger(__name__)
 
 
 def enabled() -> bool:
     return os.environ.get(_ENABLED_ENV, "").lower() in {"1", "true", "yes"}
+
+
+def debug_operation_site(
+    instrumentation_site: str, name: str, *, compiling: bool
+) -> None:
+    """Log distinct instrumented execution states when explicitly enabled."""
+    if not os.environ.get("VLLM_SIMFER_DEBUG_PROVENANCE"):
+        return
+    state = (
+        instrumentation_site,
+        name,
+        compiling,
+        getattr(_ACTIVE, "capture", None) is not None,
+    )
+    if state in _DEBUG_STATES:
+        return
+    _DEBUG_STATES.add(state)
+    logger.warning(
+        "SimFer operation site=%s name=%s compiling=%s graph_capture=%s",
+        *state,
+    )
 
 
 @dataclass
@@ -42,9 +66,7 @@ class _OperationBoundary:
     end: torch.cuda.Event
 
 
-@torch.library.custom_op(
-    "vllm::simfer_record_external_event", mutates_args=("anchor",)
-)
+@torch.library.custom_op("vllm::simfer_record_external_event", mutates_args=("anchor",))
 def _record_external_event(anchor: torch.Tensor, token: int) -> None:
     """Record an external event from an opaque compiled-graph operation."""
     _COMPILED_EVENTS[token].record()
@@ -73,9 +95,19 @@ class GraphCapture:
         if len(raw_nodes) != len(nodes):
             raise RuntimeError("SimFer CUDA graph metadata node counts disagree")
         event_nodes = _event_node_indices(raw_nodes)
+        if os.environ.get("VLLM_SIMFER_DEBUG_PROVENANCE"):
+            logger.warning(
+                "SimFer graph=%s direct_operations=%d compiled_boundaries=%d "
+                "event_nodes=%d",
+                self.graph_instance_id,
+                len(self.operations),
+                len(_COMPILED_BOUNDARIES),
+                len(event_nodes),
+            )
         operations = [*self.operations, *_compiled_operations(event_nodes)]
         if not operations:
             return
+        self.operations = operations
         ownership: dict[int, _OperationBoundary] = {}
         for operation in operations:
             begin = event_nodes.get(operation.begin.cuda_event)
@@ -104,8 +136,7 @@ class GraphCapture:
             batch_descriptor=self.batch_descriptor,
             exec_graph_id=graph_data.get("exec_graph_id"),
             nodes=tuple(
-                _node_record(item, ownership.get(item["index"]))
-                for item in nodes
+                _node_record(item, ownership.get(item["index"])) for item in nodes
             ),
         )
 
@@ -176,9 +207,7 @@ def begin_compiled_operation(
     return boundary
 
 
-def end_compiled_operation(
-    boundary: _OperationBoundary, anchor: torch.Tensor
-) -> None:
+def end_compiled_operation(boundary: _OperationBoundary, anchor: torch.Tensor) -> None:
     """Insert the matching compiled end marker after the operation output."""
     _record_external_event(anchor, _register_event(boundary.end))
 
@@ -351,6 +380,7 @@ __all__ = [
     "begin_compiled_operation",
     "bindings_covered",
     "capture_graph",
+    "debug_operation_site",
     "enabled",
     "end_compiled_operation",
     "operation_scope",

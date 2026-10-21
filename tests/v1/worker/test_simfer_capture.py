@@ -4,12 +4,14 @@ import hashlib
 import json
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 import vllm.v1.worker.simfer_capture as simfer_capture
 import vllm.v1.worker.simfer_graph_provenance as graph_provenance
+from vllm.config import CUDAGraphMode
 from vllm.utils.simfer_capture import capture_operation_site
 from vllm.v1.worker.simfer_capture import (
     OperationCorrelation,
@@ -141,46 +143,108 @@ def test_graph_provenance_coalesces_nested_same_site(monkeypatch) -> None:
         graph_provenance, "_new_operation_boundary", lambda _site: boundary
     )
 
-    with graph_provenance.operation_scope("glm.kda") as outer:
-        with graph_provenance.operation_scope("glm.kda") as inner:
-            assert outer and inner
+    with (
+        graph_provenance.operation_scope("glm.kda") as outer,
+        graph_provenance.operation_scope("glm.kda") as inner,
+    ):
+        assert outer and inner
 
     assert recorded == [boundary.begin, boundary.end]
     assert capture.operations == [boundary]
 
 
-def test_breakable_eager_segment_restores_operation_scope_on_replay(
-    monkeypatch,
-) -> None:
+def test_breakable_segment_finalizes_and_identifies_provenance(monkeypatch) -> None:
     from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 
-    capture = BreakableCUDAGraphCapture()
-    monkeypatch.setattr(capture, "_end_segment", lambda: None)
-    monkeypatch.setattr(capture, "_begin_segment", lambda: None)
-    scopes = []
     calls = []
 
+    class FakeGraph:
+        def __init__(self, *, keep_graph):
+            calls.append(("graph", keep_graph))
+
+        def capture_begin(self, **kwargs):
+            calls.append(("capture_begin", kwargs))
+
+        def capture_end(self):
+            calls.append(("capture_end",))
+
+        def replay(self):
+            calls.append(("replay",))
+
     @contextmanager
-    def operation_scope(site):
-        scopes.append(("begin", site))
-        try:
-            yield True
-        finally:
-            scopes.append(("end", site))
+    def capture_graph(graph, *, runtime_mode, batch_descriptor):
+        calls.append(("provenance_begin", graph, runtime_mode, batch_descriptor))
+        yield SimpleNamespace(graph_instance_id="rank-0:cuda-graph-0")
+        calls.append(("provenance_finish",))
 
-    monkeypatch.setattr(graph_provenance, "operation_scope", operation_scope)
+    @contextmanager
+    def record_replay(graph_instance_id):
+        calls.append(("replay_begin", graph_instance_id))
+        yield
+        calls.append(("replay_end", graph_instance_id))
 
-    def operation():
-        if capture._collecting_eager_operation:
-            capture.bind_eager_operation("glm.kda")
-        calls.append("operation")
-        return "done"
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", FakeGraph)
+    monkeypatch.setattr(graph_provenance, "enabled", lambda: True)
+    monkeypatch.setattr(graph_provenance, "capture_graph", capture_graph)
+    monkeypatch.setattr(simfer_capture, "record_cuda_graph_replay", record_replay)
 
-    assert capture.add_eager(operation) == "done"
-    assert calls == ["operation"]
-    capture.segments[0]()
-    assert calls == ["operation", "operation"]
-    assert scopes == [("begin", "glm.kda"), ("end", "glm.kda")]
+    capture = BreakableCUDAGraphCapture(
+        runtime_mode=CUDAGraphMode.FULL, batch_descriptor="batch"
+    )
+    with capture:
+        pass
+    capture.replay()
+
+    assert calls[0] == ("graph", True)
+    assert calls[1][0] == "provenance_begin"
+    assert isinstance(calls[1][1], FakeGraph)
+    assert calls[1][2:] == (CUDAGraphMode.FULL, "batch")
+    assert calls[2:] == [
+        ("capture_begin", {}),
+        ("capture_end",),
+        ("provenance_finish",),
+        ("replay_begin", "rank-0:cuda-graph-0"),
+        ("replay",),
+        ("replay_end", "rank-0:cuda-graph-0"),
+    ]
+
+
+def test_breakable_piecewise_segment_does_not_retain_provenance(monkeypatch) -> None:
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    calls = []
+
+    class FakeGraph:
+        def __init__(self, *, keep_graph):
+            calls.append(("graph", keep_graph))
+
+        def capture_begin(self, **kwargs):
+            calls.append(("capture_begin", kwargs))
+
+        def capture_end(self):
+            calls.append(("capture_end",))
+
+        def replay(self):
+            calls.append(("replay",))
+
+    def unexpected_capture(*_args, **_kwargs):
+        raise AssertionError("PIECEWISE segments must not retain graph provenance")
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", FakeGraph)
+    monkeypatch.setattr(graph_provenance, "enabled", lambda: True)
+    monkeypatch.setattr(graph_provenance, "capture_graph", unexpected_capture)
+
+    capture = BreakableCUDAGraphCapture(runtime_mode=CUDAGraphMode.PIECEWISE)
+    with capture:
+        pass
+    capture.replay()
+
+    assert calls == [
+        ("graph", False),
+        ("capture_begin", {}),
+        ("capture_end",),
+        ("replay",),
+    ]
 
 
 def _enable_fake_profile(tmp_path: Path, monkeypatch) -> None:
@@ -366,8 +430,7 @@ def test_capture_emits_exact_operation_identity_to_stream_and_marker(
         "phase_end",
     ]
     assert (
-        operation_events[0]["correlation_id"]
-        == operation_events[1]["correlation_id"]
+        operation_events[0]["correlation_id"] == operation_events[1]["correlation_id"]
     )
     expected = {
         **binding.to_dict(),
@@ -401,14 +464,16 @@ def test_operation_range_requires_active_worker_step(tmp_path, monkeypatch) -> N
         timing_key_id="measurement-key-v3:attention",
     )
 
-    with pytest.raises(RuntimeError, match="active worker step"):
-        with record_operation(
+    with (
+        pytest.raises(RuntimeError, match="active worker step"),
+        record_operation(
             "attention",
             binding,
             correlation_id="operation:attention:0",
             resource="gpu:compute",
-        ):
-            pass
+        ),
+    ):
+        pass
 
 
 def test_step_phase_ignores_capture_lifecycle_work_outside_worker_step(
@@ -424,7 +489,6 @@ def test_step_phase_ignores_capture_lifecycle_work_outside_worker_step(
 
 def test_warmup_sample_tokens_uses_only_lifecycle_aware_phases() -> None:
     """Every nested range in vLLM's warmup entry point must tolerate no step."""
-
     source = (
         Path(simfer_capture.__file__).parent / "gpu" / "model_runner.py"
     ).read_text()
@@ -503,8 +567,7 @@ def test_bound_operation_claims_exact_plan_entry_and_closes_step(
 
     assert execute(None, SchedulerOutput()) == "done"
     events = [
-        json.loads(line)
-        for line in (capture / "rank-0.jsonl").read_text().splitlines()
+        json.loads(line) for line in (capture / "rank-0.jsonl").read_text().splitlines()
     ]
     assert events[1]["payload"]["operation_correlation"] == {
         "schema_version": 1,
@@ -576,14 +639,12 @@ def test_bound_operation_ignores_unprofiled_match_then_uses_local_step_zero(
     assert execute(None, SchedulerOutput()) == "done"
     assert execute(None, SchedulerOutput()) == "done"
     events = [
-        json.loads(line)
-        for line in (capture / "rank-0.jsonl").read_text().splitlines()
+        json.loads(line) for line in (capture / "rank-0.jsonl").read_text().splitlines()
     ]
     operation_starts = [
         event
         for event in events
-        if event["kind"] == "phase_start"
-        and event["payload"]["name"] == "kda"
+        if event["kind"] == "phase_start" and event["payload"]["name"] == "kda"
     ]
     assert len(operation_starts) == 1
     assert operation_starts[0]["step_index"] == 1
@@ -631,8 +692,7 @@ def test_capture_profiles_only_selected_step_and_observes_device_completion(
 
     assert execute(None, SchedulerOutput()) == "done"
     events = [
-        json.loads(line)
-        for line in (capture / "rank-0.jsonl").read_text().splitlines()
+        json.loads(line) for line in (capture / "rank-0.jsonl").read_text().splitlines()
     ]
 
     assert synchronized == [True]
