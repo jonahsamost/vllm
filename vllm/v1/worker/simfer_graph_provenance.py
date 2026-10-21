@@ -66,7 +66,12 @@ class GraphCapture:
                 raise RuntimeError(
                     "SimFer operation boundary event is absent from graph"
                 )
-            for index in _nodes_between(nodes, begin, end):
+            operation_nodes = _nodes_between(nodes, begin, end)
+            if not operation_nodes:
+                raise RuntimeError(
+                    "SimFer operation scope captured no CUDA graph nodes"
+                )
+            for index in operation_nodes:
                 prior = ownership.setdefault(index, operation)
                 if prior.correlation_id != operation.correlation_id:
                     raise RuntimeError("SimFer CUDA graph operation scopes overlap")
