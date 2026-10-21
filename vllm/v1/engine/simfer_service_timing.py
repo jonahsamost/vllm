@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in, capture-independent engine-step service timing for SimFer.
 
 This module deliberately has no dependency on ``simfer_capture`` or a device
@@ -25,6 +26,8 @@ _SELECTION_MODE_ENV = "VLLM_SIMFER_SERVICE_TIMING_SELECTION_MODE"
 _SKIP_MATCHES_ENV = "VLLM_SIMFER_SERVICE_TIMING_SKIP_MATCHES"
 _MATCH_STRIDE_ENV = "VLLM_SIMFER_SERVICE_TIMING_MATCH_STRIDE"
 _READY_FILE_ENV = "VLLM_SIMFER_SERVICE_TIMING_READY_FILE"
+_INSTRUMENTATION_ENV = "VLLM_SIMFER_SERVICE_TIMING_INSTRUMENTATION"
+_PARTICIPANT_RANK_ENV = "VLLM_SIMFER_SERVICE_TIMING_PARTICIPANT_RANK"
 _CONTINUOUS_SELECTION_MODE = "continuous_matches"
 
 
@@ -87,6 +90,14 @@ class ServiceTimingRecorder:
 
     def set_participant_rank(self, rank: int) -> None:
         """Bind the owning EngineCore's DP scheduler identity."""
+        override = os.environ.get(_PARTICIPANT_RANK_ENV)
+        if override is not None:
+            try:
+                rank = int(override)
+            except ValueError as error:
+                raise ValueError(
+                    "service-timing participant rank must be an integer"
+                ) from error
         if rank < 0:
             raise ValueError("service-timing participant rank cannot be negative")
         with self._lock:
@@ -121,9 +132,7 @@ class ServiceTimingRecorder:
                     return None
                 match_index = self._continuous_matches
                 self._continuous_matches += 1
-                if match_index < skip_matches or (
-                    match_index - skip_matches
-                ) % stride:
+                if match_index < skip_matches or (match_index - skip_matches) % stride:
                     return None
                 sample_index = self._samples
                 self._samples += 1
@@ -183,7 +192,7 @@ class ServiceTimingRecorder:
             "duration_ns": finished_ns - selection.started_ns,
             "timer": "engine_core_step_perf_counter",
             "clock_scope": "single_host_monotonic",
-            "instrumentation": "none",
+            "instrumentation": os.environ.get(_INSTRUMENTATION_ENV, "none"),
         }
         encoded = (json.dumps(event, sort_keys=True) + "\n").encode()
         descriptor = os.open(
@@ -213,11 +222,7 @@ def _selection_config() -> tuple[frozenset[int], int]:
         maximum = int(os.environ.get(_MAX_STEPS_ENV, "1"))
     except ValueError as error:
         raise ValueError("invalid SimFer service-timing selection") from error
-    if (
-        not token_counts
-        or any(value < 0 for value in token_counts)
-        or maximum <= 0
-    ):
+    if not token_counts or any(value < 0 for value in token_counts) or maximum <= 0:
         raise ValueError("invalid SimFer service-timing selection bounds")
     return token_counts, maximum
 

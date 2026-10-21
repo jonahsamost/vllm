@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Low-level, opt-in SimFer instrumentation hooks.
 
 Model and provider modules must not import the v1 worker package while their
@@ -10,6 +11,7 @@ enters the worker-owned correlation context at the exact call boundary.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from functools import wraps
 from typing import Any
 
@@ -19,6 +21,7 @@ import torch
 def _first_tensor(value: Any) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
         return value
+    values: Iterable[Any]
     if isinstance(value, dict):
         values = value.values()
     elif isinstance(value, (tuple, list)):

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import json
 from collections import deque
 from contextlib import nullcontext
@@ -50,6 +53,51 @@ def test_records_only_selected_clean_engine_steps(tmp_path, monkeypatch) -> None
     assert all(event["instrumentation"] == "none" for event in events)
     assert all(event["timer"] == "engine_core_step_perf_counter" for event in events)
     assert all(event["capture_id"] == "capture:test" for event in events)
+
+
+def test_records_declared_captured_graph_instrumentation(tmp_path, monkeypatch) -> None:
+    _configure(tmp_path, monkeypatch)
+    monkeypatch.setenv(
+        "VLLM_SIMFER_SERVICE_TIMING_INSTRUMENTATION",
+        "captured_cuda_graph_external_events",
+    )
+    timestamps = iter((10, 30))
+    monkeypatch.setattr(
+        service_timing.time, "perf_counter_ns", lambda: next(timestamps)
+    )
+    recorder = service_timing.ServiceTimingRecorder()
+
+    recorder.arm_iteration(skip_matches=0)
+    selection = recorder.claim(SchedulerOutput(4), started_ns=recorder.begin())
+    recorder.finish(selection)
+
+    event = json.loads((tmp_path / "rank-3.jsonl").read_text())
+    assert event["instrumentation"] == "captured_cuda_graph_external_events"
+
+
+def test_explicit_participant_rank_overrides_dp_rank(tmp_path, monkeypatch) -> None:
+    _configure(tmp_path, monkeypatch)
+    monkeypatch.setenv("VLLM_SIMFER_SERVICE_TIMING_PARTICIPANT_RANK", "2")
+    timestamps = iter((10, 30))
+    monkeypatch.setattr(
+        service_timing.time, "perf_counter_ns", lambda: next(timestamps)
+    )
+    recorder = service_timing.ServiceTimingRecorder()
+    recorder.set_participant_rank(0)
+
+    recorder.arm_iteration(skip_matches=0)
+    selection = recorder.claim(SchedulerOutput(4), started_ns=recorder.begin())
+    recorder.finish(selection)
+
+    event = json.loads((tmp_path / "rank-2.jsonl").read_text())
+    assert event["rank"] == 2
+
+
+def test_explicit_participant_rank_must_be_valid(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SIMFER_SERVICE_TIMING_PARTICIPANT_RANK", "not-a-rank")
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        service_timing.ServiceTimingRecorder().set_participant_rank(0)
 
 
 def test_refuses_to_time_inside_structural_capture(tmp_path, monkeypatch) -> None:
@@ -118,9 +166,7 @@ def test_continuous_selection_skips_and_strides_without_parent_arming(
 
     selected = []
     for _index in range(9):
-        selection = recorder.claim(
-            SchedulerOutput(4), started_ns=recorder.begin()
-        )
+        selection = recorder.claim(SchedulerOutput(4), started_ns=recorder.begin())
         if selection is not None:
             selected.append(selection)
 

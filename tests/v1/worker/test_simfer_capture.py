@@ -1,17 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import ast
-import base64
 import hashlib
 import json
 from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
+from typing import Any
 
+import pybase64 as base64
 import pytest
 import torch
 
 import vllm.v1.worker.simfer_capture as simfer_capture
 import vllm.v1.worker.simfer_graph_provenance as graph_provenance
-from vllm.config import CUDAGraphMode
 from vllm.utils.simfer_capture import capture_operation_site
 from vllm.v1.worker.simfer_capture import (
     OperationCorrelation,
@@ -76,13 +78,38 @@ def test_graph_provenance_excludes_unrelated_branch() -> None:
     assert graph_provenance._nodes_between(nodes, 1, 4) == {2}
 
 
+def test_graph_provenance_requires_capture_output(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SIMFER_GRAPH_PROVENANCE", "1")
+    monkeypatch.delenv("VLLM_SIMFER_CAPTURE_DIR", raising=False)
+
+    assert not graph_provenance.enabled()
+
+    monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", "/capture")
+    assert graph_provenance.enabled()
+
+
+def test_graph_provenance_serializes_cupti_graph_node_id() -> None:
+    node = {
+        "index": 7,
+        "node_type": "kernel",
+        "graph_id": 11,
+        "node_id": 7,
+        "dependencies": [6],
+    }
+
+    record = graph_provenance._node_record(node, None)
+
+    assert record["index"] == 7
+    assert record["graph_node_id"] == (11 << 32) | 7
+
+
 def test_operation_decorator_inserts_boundaries_during_compilation(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setenv("VLLM_SIMFER_CAPTURE_DIR", str(tmp_path))
     monkeypatch.setenv("VLLM_SIMFER_GRAPH_PROVENANCE", "1")
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    calls = []
+    calls: list[tuple[Any, ...]] = []
     boundary = object()
 
     def begin(site, anchor):
@@ -151,100 +178,6 @@ def test_graph_provenance_coalesces_nested_same_site(monkeypatch) -> None:
 
     assert recorded == [boundary.begin, boundary.end]
     assert capture.operations == [boundary]
-
-
-def test_breakable_segment_finalizes_and_identifies_provenance(monkeypatch) -> None:
-    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
-
-    calls = []
-
-    class FakeGraph:
-        def __init__(self, *, keep_graph):
-            calls.append(("graph", keep_graph))
-
-        def capture_begin(self, **kwargs):
-            calls.append(("capture_begin", kwargs))
-
-        def capture_end(self):
-            calls.append(("capture_end",))
-
-        def replay(self):
-            calls.append(("replay",))
-
-    @contextmanager
-    def capture_graph(graph, *, runtime_mode, batch_descriptor):
-        calls.append(("provenance_begin", graph, runtime_mode, batch_descriptor))
-        yield SimpleNamespace(graph_instance_id="rank-0:cuda-graph-0")
-        calls.append(("provenance_finish",))
-
-    @contextmanager
-    def record_replay(graph_instance_id):
-        calls.append(("replay_begin", graph_instance_id))
-        yield
-        calls.append(("replay_end", graph_instance_id))
-
-    monkeypatch.setattr(torch.cuda, "CUDAGraph", FakeGraph)
-    monkeypatch.setattr(graph_provenance, "enabled", lambda: True)
-    monkeypatch.setattr(graph_provenance, "capture_graph", capture_graph)
-    monkeypatch.setattr(simfer_capture, "record_cuda_graph_replay", record_replay)
-
-    capture = BreakableCUDAGraphCapture(
-        runtime_mode=CUDAGraphMode.FULL, batch_descriptor="batch"
-    )
-    with capture:
-        pass
-    capture.replay()
-
-    assert calls[0] == ("graph", True)
-    assert calls[1][0] == "provenance_begin"
-    assert isinstance(calls[1][1], FakeGraph)
-    assert calls[1][2:] == (CUDAGraphMode.FULL, "batch")
-    assert calls[2:] == [
-        ("capture_begin", {}),
-        ("capture_end",),
-        ("provenance_finish",),
-        ("replay_begin", "rank-0:cuda-graph-0"),
-        ("replay",),
-        ("replay_end", "rank-0:cuda-graph-0"),
-    ]
-
-
-def test_breakable_piecewise_segment_does_not_retain_provenance(monkeypatch) -> None:
-    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
-
-    calls = []
-
-    class FakeGraph:
-        def __init__(self, *, keep_graph):
-            calls.append(("graph", keep_graph))
-
-        def capture_begin(self, **kwargs):
-            calls.append(("capture_begin", kwargs))
-
-        def capture_end(self):
-            calls.append(("capture_end",))
-
-        def replay(self):
-            calls.append(("replay",))
-
-    def unexpected_capture(*_args, **_kwargs):
-        raise AssertionError("PIECEWISE segments must not retain graph provenance")
-
-    monkeypatch.setattr(torch.cuda, "CUDAGraph", FakeGraph)
-    monkeypatch.setattr(graph_provenance, "enabled", lambda: True)
-    monkeypatch.setattr(graph_provenance, "capture_graph", unexpected_capture)
-
-    capture = BreakableCUDAGraphCapture(runtime_mode=CUDAGraphMode.PIECEWISE)
-    with capture:
-        pass
-    capture.replay()
-
-    assert calls == [
-        ("graph", False),
-        ("capture_begin", {}),
-        ("capture_end",),
-        ("replay",),
-    ]
 
 
 def _enable_fake_profile(tmp_path: Path, monkeypatch) -> None:

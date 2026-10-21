@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exact SimFer operation provenance for CUDA graph replay.
 
 The feature is opt-in.  During capture, external CUDA events bracket each
@@ -33,7 +34,9 @@ logger = logging.getLogger(__name__)
 
 
 def enabled() -> bool:
-    return os.environ.get(_ENABLED_ENV, "").lower() in {"1", "true", "yes"}
+    return bool(os.environ.get("VLLM_SIMFER_CAPTURE_DIR")) and os.environ.get(
+        _ENABLED_ENV, ""
+    ).lower() in {"1", "true", "yes"}
 
 
 def debug_operation_site(
@@ -136,7 +139,11 @@ class GraphCapture:
             batch_descriptor=self.batch_descriptor,
             exec_graph_id=graph_data.get("exec_graph_id"),
             nodes=tuple(
-                _node_record(item, ownership.get(item["index"])) for item in nodes
+                _node_record(
+                    item,
+                    ownership.get(item["index"]),
+                )
+                for item in nodes
             ),
         )
 
@@ -182,7 +189,7 @@ def operation_scope(instrumentation_site: str) -> Iterator[bool]:
     if capture is None:
         yield False
         return
-    active_sites = getattr(_ACTIVE, "operation_sites", set())
+    active_sites: set[str] = getattr(_ACTIVE, "operation_sites", set())
     if instrumentation_site in active_sites:
         yield True
         return
@@ -329,13 +336,16 @@ def _nodes_between(nodes: list[dict[str, Any]], begin: int, end: int) -> set[int
 
 
 def _node_record(
-    node: dict[str, Any], operation: _OperationBoundary | None
+    node: dict[str, Any],
+    operation: _OperationBoundary | None,
 ) -> dict[str, Any]:
     return {
         "index": node["index"],
         "node_type": node["node_type"],
         "graph_id": node["graph_id"],
-        "graph_node_id": node["node_id"],
+        # CUPTI packs the graph ID into the upper 32 bits and PyTorch's
+        # zero-based topology node ID into the lower 32 bits.
+        "graph_node_id": (int(node["graph_id"]) << 32) | int(node["node_id"]),
         "dependencies": tuple(node["dependencies"]),
         "correlation_id": None if operation is None else operation.correlation_id,
         "operation_correlation": (

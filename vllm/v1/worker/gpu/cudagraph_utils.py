@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import itertools
+import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from contextlib import ExitStack
@@ -170,6 +171,7 @@ class CudaGraphManager:
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
 
         self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
+        self.simfer_graph_provenance: dict[BatchExecutionDescriptor, Any] = {}
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
 
         self._graphs_captured = False
@@ -460,7 +462,28 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
-                        graph = torch.cuda.CUDAGraph()
+                        from vllm.v1.worker.simfer_graph_provenance import (
+                            capture_graph as simfer_capture_graph,
+                        )
+                        from vllm.v1.worker.simfer_graph_provenance import (
+                            enabled as simfer_graph_provenance_enabled,
+                        )
+
+                        profile_tokens = {
+                            int(value)
+                            for value in os.environ.get(
+                                "VLLM_SIMFER_PROFILE_TOKEN_COUNTS", ""
+                            ).split(",")
+                            if value
+                        }
+                        provenance_enabled = (
+                            simfer_graph_provenance_enabled()
+                            and self._capture_mem_samples is None
+                            and (
+                                not profile_tokens or desc.num_tokens in profile_tokens
+                            )
+                        )
+                        graph = torch.cuda.CUDAGraph(keep_graph=provenance_enabled)
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
@@ -471,15 +494,33 @@ class CudaGraphManager:
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
                             free_before = torch.accelerator.get_memory_info()[0]
-                        with torch.cuda.graph(
-                            graph, self.pool, stream=self._capture_stream(desc)
-                        ):
+                        with ExitStack() as capture_stack:
+                            simfer_graph = (
+                                capture_stack.enter_context(
+                                    simfer_capture_graph(
+                                        graph,
+                                        runtime_mode=desc.cg_mode,
+                                        batch_descriptor=desc,
+                                    )
+                                )
+                                if provenance_enabled
+                                else None
+                            )
+                            capture_stack.enter_context(
+                                torch.cuda.graph(
+                                    graph,
+                                    self.pool,
+                                    stream=self._capture_stream(desc),
+                                )
+                            )
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
                             # forks copy_stream, but wait_prefetch only happens in
                             # the next forward pass.
                             get_offloader().join_after_forward()
+                        if simfer_graph is not None and simfer_graph.operations:
+                            self.simfer_graph_provenance[desc] = simfer_graph
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
                             free_after = torch.accelerator.get_memory_info()[0]
@@ -540,7 +581,14 @@ class CudaGraphManager:
         # cannot see. Without this, replay could overwrite static buffers
         # while those copies are still in flight.
         get_offloader().sync_prev_onload()
-        self.graphs[desc].replay()
+        provenance = self.simfer_graph_provenance.get(desc)
+        if provenance is None:
+            self.graphs[desc].replay()
+            return
+        from vllm.v1.worker.simfer_capture import record_cuda_graph_replay
+
+        with record_cuda_graph_replay(provenance.graph_instance_id):
+            self.graphs[desc].replay()
 
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:
