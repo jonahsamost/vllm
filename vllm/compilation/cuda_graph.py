@@ -133,6 +133,7 @@ class CUDAGraphEntry:
     # for cudagraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
+    simfer_graph_instance_id: str | None = None
 
 
 @dataclasses.dataclass
@@ -282,7 +283,16 @@ class CUDAGraphWrapper:
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
             entry.input_addresses = input_addresses
-            cudagraph = torch.cuda.CUDAGraph()
+            from vllm.v1.worker.simfer_graph_provenance import (
+                capture_graph as simfer_capture_graph,
+            )
+            from vllm.v1.worker.simfer_graph_provenance import (
+                enabled as simfer_graph_provenance_enabled,
+            )
+
+            cudagraph = torch.cuda.CUDAGraph(
+                keep_graph=simfer_graph_provenance_enabled()
+            )
 
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
@@ -312,7 +322,11 @@ class CUDAGraphWrapper:
                 get_offloader().sync_prev_onload()
 
                 # mind-exploding: carefully manage the reference and memory.
-                with torch.cuda.graph(
+                with simfer_capture_graph(
+                    cudagraph,
+                    runtime_mode=self.runtime_mode,
+                    batch_descriptor=entry.batch_descriptor,
+                ) as simfer_graph, torch.cuda.graph(
                     cudagraph,
                     pool=self.graph_pool,
                     stream=current_stream(),
@@ -332,6 +346,8 @@ class CUDAGraphWrapper:
                         # the output of the last graph will not be used by
                         # any other cuda graph.
                         output = weak_ref_tensors(output)
+                if simfer_graph is not None and simfer_graph.operations:
+                    entry.simfer_graph_instance_id = simfer_graph.graph_instance_id
 
             # here we always use weak ref for the output
             # to save memory
@@ -359,5 +375,8 @@ class CUDAGraphWrapper:
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
-        entry.cudagraph.replay()
+        from vllm.v1.worker.simfer_capture import record_cuda_graph_replay
+
+        with record_cuda_graph_replay(entry.simfer_graph_instance_id):
+            entry.cudagraph.replay()
         return entry.output

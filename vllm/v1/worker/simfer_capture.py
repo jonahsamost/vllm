@@ -313,6 +313,60 @@ def record_bound_operation(
         yield correlation_id
 
 
+@contextmanager
+def record_cuda_graph_replay(graph_instance_id: str | None) -> Any:
+    """Mark one graph launch so profiler evidence can join it to capture."""
+    if (
+        not enabled()
+        or graph_instance_id is None
+        or _ACTIVE_STEP is None
+        or _ACTIVE_STEP_CORRELATION is None
+    ):
+        yield None
+        return
+    correlation = _new_correlation_id("cuda-graph-replay")
+    with _record_range(
+        "cuda_graph_replay",
+        "gpu",
+        correlation,
+        {"graph_instance_id": graph_instance_id},
+        {"cuda_graph_replay": {"graph_instance_id": graph_instance_id}},
+    ):
+        yield correlation
+
+
+def graph_operation_bindings(
+    rank: int, instrumentation_site: str
+) -> tuple[tuple[tuple[int, int, str, int], dict[str, Any]], ...]:
+    """Return canonical plan bindings used as graph-capture templates."""
+    _load_operation_plan()
+    step_index = int(os.environ.get("VLLM_SIMFER_OPERATION_STEP_INDEX", "0"))
+    return tuple(
+        (
+            key,
+            {
+                "correlation_id": item["correlation_id"],
+                "schema_version": 1,
+                "physical_operation_id": item["physical_operation_id"],
+                "semantic_operation_ids": tuple(item["semantic_operation_ids"]),
+                "timing_key_id": item["timing_key_id"],
+                "dependency_correlation_ids": tuple(
+                    item["dependency_correlation_ids"]
+                ),
+            },
+        )
+        for key, item in sorted(_OPERATION_PLAN.items())
+        if key[0] == rank and key[1] == step_index and key[2] == instrumentation_site
+    )
+
+
+def operation_plan_coordinates(
+    rank: int, step_index: int
+) -> set[tuple[int, int, str, int]]:
+    _load_operation_plan()
+    return {key for key in _OPERATION_PLAN if key[0] == rank and key[1] == step_index}
+
+
 def _claim_operation_binding(
     instrumentation_site: str,
 ) -> tuple[OperationCorrelation, str]:
@@ -443,6 +497,11 @@ def _verify_step_operation_bindings(step_index: int | None) -> None:
         return
     _load_operation_plan()
     rank = _rank()
+    if os.environ.get("VLLM_SIMFER_GRAPH_PROVENANCE"):
+        from vllm.v1.worker.simfer_graph_provenance import bindings_covered
+
+        if bindings_covered(rank, step_index):
+            return
     expected = {
         key for key in _OPERATION_PLAN if key[0] == rank and key[1] == step_index
     }

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import vllm.v1.worker.simfer_capture as simfer_capture
+import vllm.v1.worker.simfer_graph_provenance as graph_provenance
 from vllm.utils.simfer_capture import capture_operation_site
 from vllm.v1.worker.simfer_capture import (
     OperationCorrelation,
@@ -47,6 +48,30 @@ def _operation_plan(path: Path, capture_id: str) -> Path:
     }
     path.write_text(json.dumps(value))
     return path
+
+
+def test_graph_provenance_selects_nodes_between_event_boundaries() -> None:
+    nodes = [
+        {"index": 0, "dependencies": []},
+        {"index": 1, "dependencies": [0]},
+        {"index": 2, "dependencies": [1]},
+        {"index": 3, "dependencies": [2]},
+        {"index": 4, "dependencies": [3]},
+    ]
+
+    assert graph_provenance._nodes_between(nodes, 1, 4) == {2, 3}
+
+
+def test_graph_provenance_excludes_unrelated_branch() -> None:
+    nodes = [
+        {"index": 0, "dependencies": []},
+        {"index": 1, "dependencies": [0]},
+        {"index": 2, "dependencies": [1]},
+        {"index": 3, "dependencies": [0]},
+        {"index": 4, "dependencies": [2, 3]},
+    ]
+
+    assert graph_provenance._nodes_between(nodes, 1, 4) == {2}
 
 
 def _enable_fake_profile(tmp_path: Path, monkeypatch) -> None:

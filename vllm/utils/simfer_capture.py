@@ -30,6 +30,11 @@ def capture_operation_site(
         def wrapped(*args: Any, **kwargs: Any) -> Any:
             if not os.environ.get("VLLM_SIMFER_CAPTURE_DIR"):
                 return function(*args, **kwargs)
+            from vllm.v1.worker.simfer_graph_provenance import operation_scope
+
+            with operation_scope(instrumentation_site) as captured:
+                if captured:
+                    return function(*args, **kwargs)
             from vllm.v1.worker.simfer_capture import record_bound_operation
 
             with record_bound_operation(
