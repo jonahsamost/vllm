@@ -13,9 +13,16 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable
 from functools import wraps
-from typing import Any
+from typing import Any, Protocol, cast
 
 import torch
+
+
+class _InstrumentedCallable(Protocol):
+    __simfer_instrumentation_site__: str
+    __simfer_operation_name__: str
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 def _first_tensor(value: Any) -> torch.Tensor:
@@ -96,9 +103,10 @@ def capture_operation_site(
             ):
                 return function(*args, **kwargs)
 
-        wrapped.__simfer_instrumentation_site__ = instrumentation_site
-        wrapped.__simfer_operation_name__ = name
-        return wrapped
+        instrumented = cast(_InstrumentedCallable, wrapped)
+        instrumented.__simfer_instrumentation_site__ = instrumentation_site
+        instrumented.__simfer_operation_name__ = name
+        return instrumented
 
     return decorate
 
