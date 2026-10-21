@@ -66,6 +66,18 @@ def test_graph_provenance_selects_nodes_between_event_boundaries() -> None:
     assert graph_provenance._nodes_between(nodes, 1, 4) == {2, 3}
 
 
+def test_shared_linear_boundaries_publish_stable_simfer_site_metadata() -> None:
+    from vllm.model_executor.layers.linear import (
+        ColumnParallelLinear,
+        ReplicatedLinear,
+        RowParallelLinear,
+    )
+
+    for linear_type in (ReplicatedLinear, ColumnParallelLinear, RowParallelLinear):
+        assert linear_type.forward.__simfer_instrumentation_site__ == "physical.linear"
+        assert linear_type.forward.__simfer_operation_name__ == "linear"
+
+
 def test_graph_provenance_excludes_unrelated_branch() -> None:
     nodes = [
         {"index": 0, "dependencies": []},

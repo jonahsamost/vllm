@@ -92,6 +92,8 @@ def capture_operation_site(
             ):
                 return function(*args, **kwargs)
 
+        wrapped.__simfer_instrumentation_site__ = instrumentation_site
+        wrapped.__simfer_operation_name__ = name
         return wrapped
 
     return decorate

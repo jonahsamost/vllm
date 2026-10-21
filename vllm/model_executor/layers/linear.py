@@ -43,6 +43,7 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.utils.simfer_capture import capture_operation_site
 
 logger = init_logger(__name__)
 
@@ -408,6 +409,7 @@ class ReplicatedLinear(LinearBase):
         )
         param.data.copy_(loaded_weight)
 
+    @capture_operation_site("physical.linear", "linear")
     def forward(
         self,
         x: torch.Tensor,
@@ -600,6 +602,7 @@ class ColumnParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
         param.load_column_parallel_weight(loaded_weight=loaded_weight)
 
+    @capture_operation_site("physical.linear", "linear")
     def forward(
         self,
         input_,
@@ -1759,6 +1762,7 @@ class RowParallelLinear(LinearBase):
 
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
+    @capture_operation_site("physical.linear", "linear")
     def forward(
         self,
         input_,
