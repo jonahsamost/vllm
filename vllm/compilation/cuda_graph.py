@@ -133,7 +133,8 @@ class CUDAGraphEntry:
     # for cudagraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
-    simfer_graph_instance_id: str | None = None
+    # Retain provenance boundary events for as long as the graph can replay.
+    simfer_graph_provenance: Any | None = None
 
 
 @dataclasses.dataclass
@@ -347,7 +348,7 @@ class CUDAGraphWrapper:
                         # any other cuda graph.
                         output = weak_ref_tensors(output)
                 if simfer_graph is not None and simfer_graph.operations:
-                    entry.simfer_graph_instance_id = simfer_graph.graph_instance_id
+                    entry.simfer_graph_provenance = simfer_graph
 
             # here we always use weak ref for the output
             # to save memory
@@ -377,6 +378,11 @@ class CUDAGraphWrapper:
         get_offloader().sync_prev_onload()
         from vllm.v1.worker.simfer_capture import record_cuda_graph_replay
 
-        with record_cuda_graph_replay(entry.simfer_graph_instance_id):
+        graph_instance_id = (
+            None
+            if entry.simfer_graph_provenance is None
+            else entry.simfer_graph_provenance.graph_instance_id
+        )
+        with record_cuda_graph_replay(graph_instance_id):
             entry.cudagraph.replay()
         return entry.output
