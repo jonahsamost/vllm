@@ -47,6 +47,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
 )
 from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.platforms import current_platform
+from vllm.utils.simfer_capture import capture_operation_site
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
     LayerName,
@@ -223,6 +224,14 @@ def _unpack(
         return result
     else:
         return (None, result)
+
+
+@capture_operation_site("physical.moe.combine", "shared_expert_add")
+def _combine_shared_and_routed_experts(
+    shared_output: torch.Tensor,
+    routed_output: torch.Tensor,
+) -> torch.Tensor:
+    return torch.add(shared_output, routed_output)
 
 
 class MoERunner(MoERunnerInterface):
@@ -779,7 +788,10 @@ class MoERunner(MoERunnerInterface):
         fused_output = self.apply_routed_output_transform(fused_output)
 
         if shared_output is not None:
-            result = shared_output + fused_output
+            result = _combine_shared_and_routed_experts(
+                shared_output,
+                fused_output,
+            )
         else:
             result = fused_output
 

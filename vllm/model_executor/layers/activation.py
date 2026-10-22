@@ -14,6 +14,7 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.collection_utils import LazyDict
+from vllm.utils.simfer_capture import capture_operation_site
 
 logger = init_logger(__name__)
 
@@ -239,6 +240,10 @@ class SiluAndMulWithClamp(CustomOp):
             self.op = torch.ops._C.silu_and_mul_with_clamp
         elif current_platform.is_cpu():
             self._forward_method = self.forward_native
+
+    @capture_operation_site("physical.activation", "silu_and_mul_with_clamp")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2

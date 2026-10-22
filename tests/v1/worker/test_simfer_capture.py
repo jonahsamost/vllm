@@ -93,6 +93,44 @@ def test_triton_experts_publish_stable_simfer_site_metadata() -> None:
     assert TritonExperts.apply.__simfer_operation_name__ == "triton_experts"
 
 
+def test_moe_combine_and_activation_publish_stable_simfer_site_metadata(
+    default_vllm_config,
+) -> None:
+    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+        _combine_shared_and_routed_experts,
+    )
+
+    assert (
+        SiluAndMulWithClamp.forward.__simfer_instrumentation_site__
+        == "physical.activation"
+    )
+    assert (
+        SiluAndMulWithClamp.forward.__simfer_operation_name__
+        == "silu_and_mul_with_clamp"
+    )
+    assert (
+        _combine_shared_and_routed_experts.__simfer_instrumentation_site__
+        == "physical.moe.combine"
+    )
+    assert (
+        _combine_shared_and_routed_experts.__simfer_operation_name__
+        == "shared_expert_add"
+    )
+    activation = SiluAndMulWithClamp(7.0, compile_native=False)
+    activation_input = torch.tensor([[1.0, 2.0]])
+    assert torch.equal(
+        activation(activation_input),
+        activation.forward_native(activation_input),
+    )
+    left = torch.tensor([1.0])
+    right = torch.tensor([2.0])
+    assert torch.equal(
+        _combine_shared_and_routed_experts(left, right),
+        torch.tensor([3.0]),
+    )
+
+
 def test_graph_provenance_excludes_unrelated_branch() -> None:
     nodes = [
         {"index": 0, "dependencies": []},
