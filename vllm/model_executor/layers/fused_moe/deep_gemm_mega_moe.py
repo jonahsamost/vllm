@@ -792,6 +792,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
                 ]
                 if eplb_state.num_unpadded_tokens_tensors is not None
                 else None,
+                expert_token_view=eplb_state.expert_token_view,
             )
 
         from vllm.utils.deep_gemm import _import_deep_gemm
