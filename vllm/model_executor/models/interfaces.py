@@ -1093,6 +1093,7 @@ class MixtureOfExperts(Protocol):
     def set_eplb_state(
         self,
         expert_load_view: Tensor,
+        expert_token_view: Tensor,
         logical_to_physical_map: Tensor,
         logical_replica_count: Tensor,
     ) -> None:
@@ -1125,6 +1126,7 @@ class MixtureOfExperts(Protocol):
             layer.set_eplb_state(
                 moe_layer_idx=layer_idx,
                 expert_load_view=expert_load_view,
+                expert_token_view=expert_token_view,
                 logical_to_physical_map=logical_to_physical_map,
                 logical_replica_count=logical_replica_count,
             )

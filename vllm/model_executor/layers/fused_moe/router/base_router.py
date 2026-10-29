@@ -131,25 +131,31 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
     def eplb_map_to_physical_and_record(
         topk_ids: torch.Tensor,
         expert_load_view: torch.Tensor,
+        expert_token_view: torch.Tensor,
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Fused triton implementation: mapping + optional recording in one kernel.
-        return _eplb_map_and_record_triton(
-            topk_ids=topk_ids,
-            logical_to_physical_map=logical_to_physical_map,
-            logical_replica_count=logical_replica_count,
-            expert_load_view=expert_load_view,
-            record_enabled=record_enabled,
-            num_unpadded_tokens=num_unpadded_tokens,
-        )
+        if expert_token_view is not None:
+            # TODO add corr aware eplb
+            ...
+        else:
+            return _eplb_map_and_record_triton(
+                topk_ids=topk_ids,
+                logical_to_physical_map=logical_to_physical_map,
+                logical_replica_count=logical_replica_count,
+                expert_load_view=expert_load_view,
+                record_enabled=record_enabled,
+                num_unpadded_tokens=num_unpadded_tokens,
+            )
 else:
 
     def eplb_map_to_physical_and_record(
         topk_ids: torch.Tensor,
         expert_load_view: torch.Tensor,
+        expert_token_view: torch.Tensor,
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
         record_enabled: torch.Tensor,
@@ -229,6 +235,7 @@ class BaseRouter(FusedMoERouter):
                 logical_to_physical_map=eplb_state.logical_to_physical_map,
                 logical_replica_count=eplb_state.logical_replica_count,
                 expert_load_view=eplb_state.expert_load_view,
+                expert_tokn_view=eplb_state.expert_token_view,
                 record_enabled=eplb_state.should_record_tensor,
                 num_unpadded_tokens=eplb_state.num_unpadded_tokens_tensors[
                     dbo_current_ubatch_id()

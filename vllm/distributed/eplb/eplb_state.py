@@ -169,6 +169,13 @@ class EplbModelState:
     """
     expert_load_pass_buffer: torch.Tensor
     """Maximum-capacity buffer backing ``expert_load_pass``."""
+    expert_token_buffer: torch.Tensor | None
+    """
+    Counts of logical expert pairs selected by the same token. Allocated only
+    for the correlation-aware policy.
+
+    Shape: (num_moe_layers, num_logical_experts, num_logical_experts)
+    """
     expert_load_window: torch.Tensor
     """
     A sliding window of expert load.
@@ -476,6 +483,19 @@ class EplbState:
         self.policy = EPLB_POLICIES[policy_type]
         logger.debug("Selected EPLB policy: %s", policy_type)
 
+        if policy_type == "corr_aware":
+            expert_token_buffer = torch.zeros(
+                (
+                    model.num_moe_layers,
+                    model.num_logical_experts,
+                    model.num_logical_experts,
+                ),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        else:
+            expert_token_buffer = None
+
         # num_ubatches is 0 when DBO is disabled.
         num_ubatches = max(1, self.parallel_config.num_ubatches)
         num_unpadded_tokens_tensors = [
@@ -485,6 +505,7 @@ class EplbState:
 
         model.set_eplb_state(
             expert_load_pass_buffer,
+            expert_token_buffer,
             logical_to_physical_map,
             logical_replica_count,
         )
@@ -507,6 +528,7 @@ class EplbState:
             logical_to_physical_map=logical_to_physical_map,
             logical_replica_count=logical_replica_count,
             expert_load_pass=expert_load_pass,
+            expert_token_buffer=expert_token_buffer,
             expert_load_pass_buffer=expert_load_pass_buffer,
             expert_load_window=expert_load_window,
             last_expert_load=torch.ones(
@@ -602,9 +624,12 @@ class EplbState:
             # Sync the expert load pass for each model (main and drafter).
             # expert_load_pass: (num_moe_layers, num_physical_experts)
             expert_load_pass_list = self._sync_load_pass()
+            expert_token_pass_list = self._sync_corr_pass()
             ep_group = get_ep_group().device_group
-            for expert_load_pass, eplb_model_state in zip(
-                expert_load_pass_list, self.model_states.values()
+            for expert_load_pass, expert_token_pass, eplb_model_state in zip(
+                expert_load_pass_list,
+                expert_token_pass_list,
+                self.model_states.values()
             ):
                 # num_tokens_per_rank: (num_moe_layers, num_ranks)
                 num_tokens_per_rank = (
@@ -1084,6 +1109,17 @@ class EplbState:
             load_pass_list.append(eplb_model_state.expert_load_pass.clone())
         return self._allreduce_list(load_pass_list)
 
+    def _sync_corr_pass(self) -> list[torch.Tensor]:
+        """Sync the expert token correlation pass across all ranks for log stats.
+        Doesn't update the expert corr pass in eplb_model_state.
+        """
+        if self.parallel_config.eplb_config.policy != "corr_aware":
+            return [None] * get_ep_group().device_group.size
+        corr_pass_list = []
+        for eplb_model_state in self.model_states.values():
+            corr_pass_list.append(eplb_model_state.expert_token_buffer.clone())
+        return self._allreduce_list(corr_pass_list)
+
     @classmethod
     def from_mapping(
         cls,
@@ -1193,6 +1229,7 @@ class EplbLayerState:
     """Runtime EPLB data stored in the MoE layer."""
 
     expert_load_view: torch.Tensor | None = None
+    expert_token_view: torch.Tensor | None = None
     logical_to_physical_map: torch.Tensor | None = None
     logical_replica_count: torch.Tensor | None = None
     should_record_tensor: torch.Tensor | None = None
@@ -1216,10 +1253,12 @@ class EplbLayerState:
         self,
         moe_layer_idx: int,
         expert_load_view: torch.Tensor,
+        expert_token_view: torch.Tensor,
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
     ) -> None:
         self.expert_load_view = expert_load_view[moe_layer_idx]
+        self.expert_token_view = expert_token_view[moe_layer_idx]
         self.logical_to_physical_map = logical_to_physical_map[moe_layer_idx]
         self.logical_replica_count = logical_replica_count[moe_layer_idx]
 

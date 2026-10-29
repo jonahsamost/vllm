@@ -1025,6 +1025,7 @@ class MoERunner(MoERunnerInterface):
         self,
         moe_layer_idx: int,
         expert_load_view: torch.Tensor,
+        expert_token_view: torch.Tensor,
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
     ) -> None:
@@ -1037,6 +1038,7 @@ class MoERunner(MoERunnerInterface):
             self.router.eplb_state.set_layer_state(
                 moe_layer_idx,
                 expert_load_view,
+                expert_token_view,
                 logical_to_physical_map,
                 logical_replica_count,
             )
