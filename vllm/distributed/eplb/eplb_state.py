@@ -283,6 +283,8 @@ class EplbState:
         a single ``.fill_()`` updates all layers at once.  Allocated on the
         first call to :meth:`_propagate_shared_tensors`.
         """
+        self.should_record_pairs_tensor: torch.Tensor | None = None
+        """Shared GPU flag for pair-count recording, when a pair buffer exists."""
         self.is_async: bool = False
         """
         The flag indicates whether the EPLB is running in async mode.
@@ -755,10 +757,9 @@ class EplbState:
     ) -> None:
         """Propagate shared tensors to every :class:`EplbLayerState`.
 
-        Allocates ``should_record_tensor`` on the first call and then
-        assigns both it and ``num_unpadded_tokens_tensors`` to every
-        MoE layer's :class:`EplbLayerState`.  All layers reference the
-        **same** objects so a single update is visible everywhere.
+        Allocates recording flags on the first call and assigns them and
+        ``num_unpadded_tokens_tensors`` to every MoE layer's
+        :class:`EplbLayerState`. All layers share the same flag tensors.
 
         Must be called after :meth:`model.set_eplb_state` so that each
         layer's ``eplb_state`` is already populated.
@@ -774,10 +775,21 @@ class EplbState:
             self.should_record_tensor = torch.ones(
                 (), dtype=torch.bool, device=self.device
             )
+        if self.should_record_pairs_tensor is None and any(
+            ls.expert_token_view is not None for ls in layer_states
+        ):
+            self.should_record_pairs_tensor = torch.zeros(
+                (), dtype=torch.bool, device=self.device
+            )
 
         for ls in layer_states:
             if ls is not None:
                 ls.should_record_tensor = self.should_record_tensor
+                ls.should_record_pairs_tensor = (
+                    self.should_record_pairs_tensor
+                    if ls.expert_token_view is not None
+                    else None
+                )
                 ls.num_unpadded_tokens_tensors = num_unpadded_tokens_tensors
 
     def rearrange(
@@ -1243,6 +1255,8 @@ class EplbLayerState:
     sliding window before the next rearrangement, so recording them wastes
     GPU work.
     """
+    should_record_pairs_tensor: torch.Tensor | None = None
+    """Shared GPU flag for recording logical expert pairs, if enabled."""
     num_unpadded_tokens_tensors: list[torch.Tensor] | None = None
     """
     Reference to the parent :class:`EplbModelState`'s tensor list so the

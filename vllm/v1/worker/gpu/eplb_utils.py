@@ -95,20 +95,30 @@ class EPLBController:
 
     @contextmanager
     def suppress(self) -> Iterator[None]:
-        """Keep warmup forwards from stepping EPLB or recording expert load."""
+        """Keep warmup forwards from stepping EPLB or recording expert stats."""
         should_record = (
             self.state.should_record_tensor if self.state is not None else None
         )
+        should_record_pairs = (
+            self.state.should_record_pairs_tensor if self.state is not None else None
+        )
         was_suppressed = self.suppressed
         was_recording = should_record.clone() if should_record is not None else None
+        was_recording_pairs = (
+            should_record_pairs.clone() if should_record_pairs is not None else None
+        )
         self.suppressed = True
         if should_record is not None:
             should_record.fill_(False)
+        if should_record_pairs is not None:
+            should_record_pairs.fill_(False)
         try:
             yield
         finally:
             if should_record is not None and was_recording is not None:
                 should_record.copy_(was_recording)
+            if should_record_pairs is not None and was_recording_pairs is not None:
+                should_record_pairs.copy_(was_recording_pairs)
             self.suppressed = was_suppressed
 
     def prepare_load(self) -> None:
