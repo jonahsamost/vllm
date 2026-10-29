@@ -1259,9 +1259,7 @@ class EplbLayerState:
     ) -> None:
         self.expert_load_view = expert_load_view[moe_layer_idx]
         self.expert_token_view = (
-            expert_token_view[moe_layer_idx]
-            if expert_token_view is not None
-            else None
+            expert_token_view[moe_layer_idx] if expert_token_view is not None else None
         )
         self.logical_to_physical_map = logical_to_physical_map[moe_layer_idx]
         self.logical_replica_count = logical_replica_count[moe_layer_idx]
