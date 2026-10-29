@@ -680,12 +680,14 @@ class DeepGemmMegaMoEExperts(nn.Module):
         expert_load_view: torch.Tensor,
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
+        expert_token_view: torch.Tensor | None = None,
     ) -> None:
         self.eplb_state.set_layer_state(
             moe_layer_idx,
             expert_load_view,
             logical_to_physical_map,
             logical_replica_count,
+            expert_token_view,
         )
 
     def get_expert_weights(self) -> list[torch.Tensor]:

@@ -505,9 +505,9 @@ class EplbState:
 
         model.set_eplb_state(
             expert_load_pass_buffer,
-            expert_token_buffer,
             logical_to_physical_map,
             logical_replica_count,
+            expert_token_view=expert_token_buffer,
         )
         self._propagate_shared_tensors(model, num_unpadded_tokens_tensors)
         expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]]
@@ -629,7 +629,7 @@ class EplbState:
             for expert_load_pass, expert_token_pass, eplb_model_state in zip(
                 expert_load_pass_list,
                 expert_token_pass_list,
-                self.model_states.values()
+                self.model_states.values(),
             ):
                 # num_tokens_per_rank: (num_moe_layers, num_ranks)
                 num_tokens_per_rank = (
@@ -1253,12 +1253,16 @@ class EplbLayerState:
         self,
         moe_layer_idx: int,
         expert_load_view: torch.Tensor,
-        expert_token_view: torch.Tensor,
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
+        expert_token_view: torch.Tensor | None = None,
     ) -> None:
         self.expert_load_view = expert_load_view[moe_layer_idx]
-        self.expert_token_view = expert_token_view[moe_layer_idx]
+        self.expert_token_view = (
+            expert_token_view[moe_layer_idx]
+            if expert_token_view is not None
+            else None
+        )
         self.logical_to_physical_map = logical_to_physical_map[moe_layer_idx]
         self.logical_replica_count = logical_replica_count[moe_layer_idx]
 

@@ -572,6 +572,7 @@ class ElasticEPScalingExecutor:
                 eplb_model_state.expert_load_pass_buffer,
                 eplb_model_state.logical_to_physical_map,
                 eplb_model_state.logical_replica_count,
+                expert_token_view=eplb_model_state.expert_token_buffer,
             )
             eplb_state._propagate_shared_tensors(
                 model, eplb_model_state.num_unpadded_tokens_tensors

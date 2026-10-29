@@ -1093,9 +1093,9 @@ class MixtureOfExperts(Protocol):
     def set_eplb_state(
         self,
         expert_load_view: Tensor,
-        expert_token_view: Tensor,
         logical_to_physical_map: Tensor,
         logical_replica_count: Tensor,
+        expert_token_view: Tensor | None = None,
     ) -> None:
         """Register the EPLB state in the MoE model.
 
@@ -1111,6 +1111,7 @@ class MixtureOfExperts(Protocol):
             expert_load_view: A view of the expert load metrics tensor.
             logical_to_physical_map: Mapping from logical to physical experts.
             logical_replica_count: Count of replicas for each logical expert.
+            expert_token_view: Optional logical expert pair counts tensor.
 
         """
         self.expert_weights = []
@@ -1126,9 +1127,9 @@ class MixtureOfExperts(Protocol):
             layer.set_eplb_state(
                 moe_layer_idx=layer_idx,
                 expert_load_view=expert_load_view,
-                expert_token_view=expert_token_view,
                 logical_to_physical_map=logical_to_physical_map,
                 logical_replica_count=logical_replica_count,
+                expert_token_view=expert_token_view,
             )
 
     def update_physical_experts_metadata(

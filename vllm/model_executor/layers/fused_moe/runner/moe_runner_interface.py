@@ -133,5 +133,6 @@ class MoERunnerInterface(PluggableLayer, ABC):
         expert_load_view: torch.Tensor,
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
+        expert_token_view: torch.Tensor | None = None,
     ) -> None:
         raise NotImplementedError
