@@ -136,6 +136,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None = None,
         expert_token_view: torch.Tensor | None = None,
+        pair_record_enabled: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if expert_token_view is not None:
             raise NotImplementedError(
@@ -159,6 +160,7 @@ else:
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None = None,
         expert_token_view: torch.Tensor | None = None,
+        pair_record_enabled: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if expert_token_view is not None:
             raise NotImplementedError(
@@ -240,6 +242,7 @@ class BaseRouter(FusedMoERouter):
                 expert_load_view=eplb_state.expert_load_view,
                 expert_token_view=eplb_state.expert_token_view,
                 record_enabled=eplb_state.should_record_tensor,
+                pair_record_enabled=eplb_state.should_record_pairs_tensor,
                 num_unpadded_tokens=eplb_state.num_unpadded_tokens_tensors[
                     dbo_current_ubatch_id()
                 ],
