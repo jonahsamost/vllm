@@ -154,9 +154,16 @@ Configure EPLB with the `--eplb-config` argument, which accepts a JSON string. T
 | `step_interval` | Frequency of rebalancing (every N engine steps) | 3000 |
 | `log_balancedness` | Log balancedness metrics (avg tokens per expert ÷ max tokens per expert) | `false` |
 | `num_redundant_experts` | Additional global experts per EP rank beyond equal distribution | `0` |
-| `use_async` | Use non-blocking EPLB for reduced latency overhead | `true` |
-| `policy` | The policy type for expert parallel load balancing | `"default"` |
+| `use_async` | Run placement planning and expert migration in the background | `true` |
+| `policy` | Expert placement policy: `"default"` or `"corr_aware"` | `"default"` |
 | `communicator` | Backend for expert weight transfers: `"torch_nccl"`, `"torch_gloo"`, `"pynccl"`, `"nixl"`,  or `null` (auto) | `null` |
+
+With `policy="corr_aware"`, `window_size` must not exceed `step_interval`. When
+an asynchronous migration is still active at the next scheduled rebalance,
+correlation-aware EPLB discards that sampling window and starts a new one.
+The policy uses token co-selection counts to place correlated experts on the
+same node and GPU, while using expert load to choose replica counts and seed
+placement. It plans asynchronously when `use_async=true`.
 
 For example:
 

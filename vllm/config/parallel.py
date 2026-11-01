@@ -125,8 +125,11 @@ class EPLBConfig:
             raise ValueError(
                 "Correlation-aware EPLB requires window_size <= step_interval."
             )
-        if self.use_async and self.policy != "default":
-            raise ValueError("Async EPLB is only supported with the default policy.")
+        if self.use_async and self.policy not in ("default", "corr_aware"):
+            raise ValueError(
+                "Async EPLB is only supported with the default and "
+                "correlation-aware policies."
+            )
         if self.use_async and self.communicator in ("torch_nccl", "pynccl"):
             raise ValueError(
                 f"{self.communicator} communicator is incompatible with "

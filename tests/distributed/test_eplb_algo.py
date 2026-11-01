@@ -5,12 +5,89 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.config.parallel import EPLBConfig
 from vllm.distributed.eplb.eplb_state import (
     _compute_eplb_load_stats,  # pyright: ignore[reportPrivateUsage]
     compute_logical_maps,
 )
+from vllm.distributed.eplb.policy.corr_aware import CorrAwareEplbPolicy
 from vllm.distributed.eplb.policy.default import DefaultEplbPolicy
 from vllm.platforms import current_platform
+
+
+def test_corr_aware_accepts_async_eplb():
+    config = EPLBConfig(policy="corr_aware", use_async=True)
+    assert config.use_async
+
+
+def test_corr_aware_without_pair_counts_uses_default_placement():
+    """Profiling and elastic resharding can plan without a pair-count sample."""
+    weight = torch.tensor([[10, 9, 2, 1]])
+    old_placement = torch.tensor([[3, 0, 2, 1]])
+
+    expected = DefaultEplbPolicy.rebalance_experts(
+        weight, 4, 1, 1, 2, old_placement
+    )
+    actual = CorrAwareEplbPolicy.rebalance_experts(
+        weight, 4, 1, 1, 2, old_placement, expert_pair_counts=None
+    )
+
+    assert torch.equal(actual, expected)
+
+
+def test_corr_aware_places_correlated_experts_together():
+    weight = torch.tensor([[10, 9, 2, 1]])
+    pairs = torch.zeros((1, 4, 4), dtype=torch.int64)
+    pairs[0, 2, 1] = 100
+    pairs[0, 3, 0] = 100
+
+    placement = CorrAwareEplbPolicy.rebalance_experts(
+        weight, 4, 1, 1, 2, expert_pair_counts=pairs
+    )
+
+    assert torch.equal(placement, torch.tensor([[0, 3, 1, 2]]))
+
+
+def test_corr_aware_replicates_heavy_expert_across_ranks():
+    weight = torch.tensor([[100, 5, 5, 5]])
+    pairs = torch.zeros((1, 4, 4), dtype=torch.int64)
+
+    placement = CorrAwareEplbPolicy.rebalance_experts(
+        weight, 6, 1, 1, 3, expert_pair_counts=pairs
+    )
+
+    assert torch.equal(
+        torch.bincount(placement[0], minlength=4), torch.tensor([3, 1, 1, 1])
+    )
+    assert all(0 in placement[0, rank * 2 : (rank + 1) * 2] for rank in range(3))
+
+
+def test_corr_aware_places_correlated_groups_on_same_node():
+    weight = torch.ones((1, 8), dtype=torch.int64)
+    pairs = torch.zeros((1, 8, 8), dtype=torch.int64)
+    pairs[0, 4, 0] = 100
+    pairs[0, 6, 2] = 100
+
+    placement = CorrAwareEplbPolicy.rebalance_experts(
+        weight, 8, 4, 2, 4, expert_pair_counts=pairs
+    )
+
+    assert set(placement[0, :4].tolist()) == {0, 1, 4, 5}
+    assert set(placement[0, 4:].tolist()) == {2, 3, 6, 7}
+
+
+def test_corr_aware_places_individual_experts_across_nodes_without_groups():
+    weight = torch.tensor([[10, 9, 2, 1]])
+    pairs = torch.zeros((1, 4, 4), dtype=torch.int64)
+    pairs[0, 2, 1] = 100
+    pairs[0, 3, 0] = 100
+
+    placement = CorrAwareEplbPolicy.rebalance_experts(
+        weight, 4, 1, 2, 4, expert_pair_counts=pairs
+    )
+
+    assert set(placement[0, :2].tolist()) == {0, 3}
+    assert set(placement[0, 2:].tolist()) == {1, 2}
 
 
 def test_eplb_load_stats_reduce_across_ranks():

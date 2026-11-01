@@ -77,8 +77,13 @@ class EplbStats:
 
     global_expert_load_window: torch.Tensor
     """
-    Experts load window.
-    Shape: (window_size, num_moe_layers, num_physical_experts)
+    Global logical expert loads.
+    Shape: (num_moe_layers, num_logical_experts)
+    """
+    expert_pair_counts: torch.Tensor | None
+    """
+    Co-selection counts for one rebalance, or None when unavailable.
+    Shape: (num_moe_layers, num_logical_experts, num_logical_experts)
     """
     num_replicas: int
     """
@@ -709,9 +714,18 @@ class EplbState:
                 eplb_model_state.rebalanced
                 for eplb_model_state in self.model_states.values()
             ):
+                if self.parallel_config.eplb_config.policy == "corr_aware":
+                    # The previous transfer is still active. Discard this window
+                    # so pair counts and load counts cover the same future steps.
+                    self.expert_rearrangement_step = 0
+                    self.expert_load_window_step = 0
+                    for model_state in self.model_states.values():
+                        model_state.expert_load_window.zero_()
+                        model_state.expert_load_pass.zero_()
+                        if model_state.expert_token_buffer is not None:
+                            model_state.expert_token_buffer.zero_()
                 # Still performing asynchronous rearrangement; update
-                # should_record (step > step_interval, so always True) and
-                # bail out before the step counter is reset.
+                # should_record and wait for the next opportunity.
                 self._update_layer_should_record(log_stats=log_stats)
                 return
             self.expert_rearrangement_step = 0
@@ -912,6 +926,13 @@ class EplbState:
             global_expert_load_windows,
             global_expert_pair_counts,
         ):
+            if (
+                self.parallel_config.eplb_config.policy == "corr_aware"
+                and not is_profile
+                and not use_last_expert_load
+                and pair_counts is None
+            ):
+                raise RuntimeError("Correlation-aware EPLB requires expert pair counts")
             if not is_profile:
                 eplb_model_state.last_expert_load = global_expert_load_window
             if not self.is_async or is_profile:
@@ -1022,6 +1043,7 @@ class EplbState:
                     # on the main thread so that async worker can access it safely
                     # while the main thread is running.
                     global_expert_load_window=global_expert_load_window.clone(),
+                    expert_pair_counts=pair_counts,
                     num_replicas=num_replicas,
                     num_groups=num_groups,
                     num_nodes=num_nodes,

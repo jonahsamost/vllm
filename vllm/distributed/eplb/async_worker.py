@@ -55,9 +55,14 @@ def run_rebalance_experts(
     assert model_state.eplb_stats is not None
     eplb_stats = model_state.eplb_stats
 
-    # Move the global expert load window to CPU for computation.
+    # Move the global statistics to CPU for policy computation.
     with device_stream(stream):
         global_expert_load_window = eplb_stats.global_expert_load_window.cpu()
+        expert_pair_counts = (
+            eplb_stats.expert_pair_counts.cpu()
+            if eplb_stats.expert_pair_counts is not None
+            else None
+        )
     # Compute new expert mappings for the model
     new_physical_to_logical_map = eplb_state.policy.rebalance_experts(
         global_expert_load_window,
@@ -66,6 +71,7 @@ def run_rebalance_experts(
         eplb_stats.num_nodes,
         eplb_stats.num_gpus,
         physical_to_logical_map_cpu,
+        expert_pair_counts=expert_pair_counts,
     )
     assert new_physical_to_logical_map.device == torch.device("cpu")
 
