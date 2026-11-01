@@ -139,8 +139,24 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         pair_record_enabled: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if expert_token_view is not None:
-            raise NotImplementedError(
-                "Correlation-aware EPLB recording kernel is not implemented"
+            if not current_platform.is_cuda():
+                raise NotImplementedError(
+                    "Correlation-aware EPLB recording is only supported on CUDA"
+                )
+            assert pair_record_enabled is not None
+            from vllm.model_executor.layers.fused_moe.router import (
+                corr_aware_eplb_kernel,
+            )
+
+            return corr_aware_eplb_kernel.eplb_corr_map_and_record_triton(
+                topk_ids=topk_ids,
+                logical_to_physical_map=logical_to_physical_map,
+                logical_replica_count=logical_replica_count,
+                expert_load_view=expert_load_view,
+                expert_token_view=expert_token_view,
+                record_enabled=record_enabled,
+                pair_record_enabled=pair_record_enabled,
+                num_unpadded_tokens=num_unpadded_tokens,
             )
         return _eplb_map_and_record_triton(
             topk_ids=topk_ids,
