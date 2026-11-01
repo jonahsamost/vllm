@@ -615,6 +615,10 @@ class ElasticEPScalingExecutor:
             torch.accelerator.synchronize()
         # reset expert_rearrangement_step to ensure all ranks are synchronized
         eplb_state.expert_rearrangement_step = 0
+        if eplb_state.should_record_pairs_tensor is not None:
+            eplb_state._update_layer_should_record(
+                log_stats=eplb_state.parallel_config.eplb_config.log_balancedness
+            )
         eplb_state.is_async = is_async_enabled
         # Start the async worker thread if it doesn't exist yet (idempotent).
         # This is needed for new workers after scale-up: they create EplbState

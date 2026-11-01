@@ -65,7 +65,9 @@ class EPLBConfig:
     """Configuration for Expert Parallel Load Balancing (EP)."""
 
     window_size: int = Field(default=1000, gt=0)
-    """Window size for expert load recording."""
+    """Window size for expert load recording. With ``corr_aware``, this must
+    not exceed ``step_interval``.
+    """
     step_interval: int = Field(default=3000, gt=0)
     """
     Interval for rearranging experts in expert parallelism.
@@ -119,6 +121,10 @@ class EPLBConfig:
 
     @model_validator(mode="after")
     def _validate_eplb_config(self) -> Self:
+        if self.policy == "corr_aware" and self.window_size > self.step_interval:
+            raise ValueError(
+                "Correlation-aware EPLB requires window_size <= step_interval."
+            )
         if self.use_async and self.policy != "default":
             raise ValueError("Async EPLB is only supported with the default policy.")
         if self.use_async and self.communicator in ("torch_nccl", "pynccl"):

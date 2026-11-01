@@ -150,7 +150,7 @@ Configure EPLB with the `--eplb-config` argument, which accepts a JSON string. T
 
 | Parameter | Description | Default |
 | --------- | ----------- | ------- |
-| `window_size` | Number of engine steps to track for rebalancing decisions | 1000 |
+| `window_size` | Number of engine steps to track for rebalancing decisions; for `corr_aware`, cannot exceed `step_interval` | 1000 |
 | `step_interval` | Frequency of rebalancing (every N engine steps) | 3000 |
 | `log_balancedness` | Log balancedness metrics (avg tokens per expert ÷ max tokens per expert) | `false` |
 | `num_redundant_experts` | Additional global experts per EP rank beyond equal distribution | `0` |

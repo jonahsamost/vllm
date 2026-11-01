@@ -278,6 +278,8 @@ class DefaultEplbPolicy(AbstractEplbPolicy):
         num_nodes: int,
         num_ranks: int,
         old_global_expert_indices: torch.Tensor | None = None,
+        *,
+        expert_pair_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Entry point for expert-parallelism load balancer.
 
@@ -293,6 +295,7 @@ class DefaultEplbPolicy(AbstractEplbPolicy):
             old_global_expert_indices: [layers, num_logical_experts], the old global
                 expert indices. Used to avoid unnecessary weight copying
                 for experts moving within one rank.
+            expert_pair_counts: Unused by the default policy.
 
         Returns:
         -------

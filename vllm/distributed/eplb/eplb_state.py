@@ -171,8 +171,9 @@ class EplbModelState:
     """Maximum-capacity buffer backing ``expert_load_pass``."""
     expert_token_buffer: torch.Tensor | None
     """
-    Counts of logical expert pairs selected by the same token. Allocated only
-    for the correlation-aware policy.
+    Counts of logical expert pairs selected by the same token during the
+    pre-rearrangement window. Reset after each non-profile rearrangement.
+    Allocated only for the correlation-aware policy.
 
     Shape: (num_moe_layers, num_logical_experts, num_logical_experts)
     """
@@ -626,12 +627,9 @@ class EplbState:
             # Sync the expert load pass for each model (main and drafter).
             # expert_load_pass: (num_moe_layers, num_physical_experts)
             expert_load_pass_list = self._sync_load_pass()
-            expert_token_pass_list = self._sync_corr_pass()
             ep_group = get_ep_group().device_group
-            for expert_load_pass, expert_token_pass, eplb_model_state in zip(
-                expert_load_pass_list,
-                expert_token_pass_list,
-                self.model_states.values(),
+            for expert_load_pass, eplb_model_state in zip(
+                expert_load_pass_list, self.model_states.values()
             ):
                 # num_tokens_per_rank: (num_moe_layers, num_ranks)
                 num_tokens_per_rank = (
@@ -744,11 +742,13 @@ class EplbState:
         return should_record_for_rearrange or should_record_for_log
 
     def _update_layer_should_record(self, log_stats: bool = False) -> None:
-        """Update the shared ``should_record_tensor`` for all layers."""
+        """Update the shared recording flags for all layers."""
         if self.should_record_tensor is not None:
             self.should_record_tensor.fill_(
                 self._should_record_current_step(log_stats=log_stats)
             )
+        if self.should_record_pairs_tensor is not None:
+            self.should_record_pairs_tensor.fill_(self._should_record_current_step())
 
     def _propagate_shared_tensors(
         self,
@@ -778,8 +778,10 @@ class EplbState:
         if self.should_record_pairs_tensor is None and any(
             ls.expert_token_view is not None for ls in layer_states
         ):
-            self.should_record_pairs_tensor = torch.zeros(
-                (), dtype=torch.bool, device=self.device
+            self.should_record_pairs_tensor = torch.tensor(
+                self._should_record_current_step(),
+                dtype=torch.bool,
+                device=self.device,
             )
 
         for ls in layer_states:
@@ -862,6 +864,18 @@ class EplbState:
         # Perform all-reduce to get the expert load across all ranks for each model
         global_expert_load_windows = self._allreduce_list(global_expert_load_windows)
 
+        global_expert_pair_counts: list[torch.Tensor | None] = []
+        for model_state in self.model_states.values():
+            pair_counts = None
+            pair_buffer = model_state.expert_token_buffer
+            if pair_buffer is not None and not is_profile:
+                if not use_last_expert_load:
+                    pair_counts = pair_buffer.clone()
+                pair_buffer.zero_()
+                if pair_counts is not None:
+                    all_reduce(pair_counts, group=ep_group)
+            global_expert_pair_counts.append(pair_counts)
+
         # TODO(bowen): Treat differently for prefill and decode nodes
         eplb_model_state = next(iter(self.model_states.values()))
         model = eplb_model_state.model
@@ -893,8 +907,10 @@ class EplbState:
             )
 
         # Get new expert mappings
-        for eplb_model_state, global_expert_load_window in zip(
-            self.model_states.values(), global_expert_load_windows
+        for eplb_model_state, global_expert_load_window, pair_counts in zip(
+            self.model_states.values(),
+            global_expert_load_windows,
+            global_expert_pair_counts,
         ):
             if not is_profile:
                 eplb_model_state.last_expert_load = global_expert_load_window
@@ -909,6 +925,9 @@ class EplbState:
                         num_nodes,
                         num_gpus,
                         eplb_model_state.physical_to_logical_map.cpu(),
+                        expert_pair_counts=(
+                            pair_counts.cpu() if pair_counts is not None else None
+                        ),
                     )
 
                 skip_rearrange = False
@@ -1121,17 +1140,6 @@ class EplbState:
             load_pass_list.append(eplb_model_state.expert_load_pass.clone())
         return self._allreduce_list(load_pass_list)
 
-    def _sync_corr_pass(self) -> list[torch.Tensor]:
-        """Sync the expert token correlation pass across all ranks for log stats.
-        Doesn't update the expert corr pass in eplb_model_state.
-        """
-        if self.parallel_config.eplb_config.policy != "corr_aware":
-            return [None] * get_ep_group().device_group.size
-        corr_pass_list = []
-        for eplb_model_state in self.model_states.values():
-            corr_pass_list.append(eplb_model_state.expert_token_buffer.clone())
-        return self._allreduce_list(corr_pass_list)
-
     @classmethod
     def from_mapping(
         cls,
@@ -1256,7 +1264,7 @@ class EplbLayerState:
     GPU work.
     """
     should_record_pairs_tensor: torch.Tensor | None = None
-    """Shared GPU flag for recording logical expert pairs, if enabled."""
+    """Shared GPU flag for recording pairs in the pre-rearrangement window."""
     num_unpadded_tokens_tensors: list[torch.Tensor] | None = None
     """
     Reference to the parent :class:`EplbModelState`'s tensor list so the

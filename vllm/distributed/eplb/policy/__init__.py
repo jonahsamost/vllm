@@ -5,15 +5,20 @@ from typing import get_args
 from vllm.config.parallel import EPLBPolicyOption
 
 from .abstract import AbstractEplbPolicy
+from .corr_aware import CorrAwareEplbPolicy
 from .default import DefaultEplbPolicy
 
-EPLB_POLICIES = {"default": DefaultEplbPolicy}
+EPLB_POLICIES = {
+    "default": DefaultEplbPolicy,
+    "corr_aware": CorrAwareEplbPolicy,
+}
 
 # Ensure that the EPLB_POLICIES keys match the EPLBPolicyOption values
 assert set(EPLB_POLICIES.keys()) == set(get_args(EPLBPolicyOption))
 
 __all__ = [
     "AbstractEplbPolicy",
+    "CorrAwareEplbPolicy",
     "DefaultEplbPolicy",
     "EPLB_POLICIES",
 ]

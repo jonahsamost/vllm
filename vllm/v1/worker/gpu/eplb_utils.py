@@ -24,6 +24,22 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@contextmanager
+def suppress_pair_recording(eplb_state: EplbState | None) -> Iterator[None]:
+    """Exclude a dummy forward from cumulative expert-pair counts."""
+    flag = eplb_state.should_record_pairs_tensor if eplb_state is not None else None
+    if flag is None:
+        yield
+        return
+
+    previous_value = flag.clone()
+    flag.fill_(False)
+    try:
+        yield
+    finally:
+        flag.copy_(previous_value)
+
+
 def eplb_draft_model_name(model_config: ModelConfig) -> str:
     """Return the EPLB step-log display name for a draft model."""
     return f"{model_config.model} (draft)"
@@ -54,7 +70,11 @@ def step_eplb_after(*, is_dummy: bool = False) -> Callable:
                 with self.eplb.suppress():
                     return fn(self, *args, **kwargs)
 
-            result = fn(self, *args, **kwargs)
+            if is_dummy:
+                with suppress_pair_recording(self.eplb.state):
+                    result = fn(self, *args, **kwargs)
+            else:
+                result = fn(self, *args, **kwargs)
             is_profile = kwargs.get("is_profile", False) if is_dummy else False
             self.eplb.step(is_dummy=is_dummy, is_profile=is_profile)
             return result

@@ -205,6 +205,7 @@ from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunne
 from vllm.v1.worker.gpu.eplb_utils import (
     draft_model_supports_eplb,
     eplb_draft_model_name,
+    suppress_pair_recording,
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
@@ -4389,7 +4390,8 @@ class GPUModelRunner(
                         )
                     if self.parallel_config.data_parallel_size > 1:
                         # Prevent hang when DP ranks disagree on input_fits_in_drafter
-                        self.drafter.dummy_run(num_tokens=1)
+                        with suppress_pair_recording(self.eplb_state):
+                            self.drafter.dummy_run(num_tokens=1)
             elif (
                 spec_config.use_ngram_gpu()
                 and not spec_config.disable_padded_drafter_batch
@@ -4466,7 +4468,8 @@ class GPUModelRunner(
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
                 )
-                self.drafter.dummy_run(num_tokens=1)
+                with suppress_pair_recording(self.eplb_state):
+                    self.drafter.dummy_run(num_tokens=1)
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
@@ -5704,12 +5707,15 @@ class GPUModelRunner(
                     use_spec_decode=self.speculative_config is not None,
                 )
 
-        with self.maybe_dummy_run_with_lora(
-            self.lora_config,
-            num_scheduled_tokens,
-            num_sampled_tokens,
-            remove_lora,
-            num_active_loras,
+        with (
+            suppress_pair_recording(self.eplb_state),
+            self.maybe_dummy_run_with_lora(
+                self.lora_config,
+                num_scheduled_tokens,
+                num_sampled_tokens,
+                remove_lora,
+                num_active_loras,
+            ),
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
