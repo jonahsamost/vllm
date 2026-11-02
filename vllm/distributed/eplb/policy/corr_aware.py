@@ -13,6 +13,38 @@ def _pair_count(counts: np.ndarray, a: int, b: int) -> int:
     return int(counts[max(a, b), min(a, b)])
 
 
+def _choose_candidate(
+    candidates: list[int],
+    affinity: dict[int, float],
+    load: list[float],
+    correlation_weight: float | None,
+) -> int:
+    if correlation_weight is None:
+        return max(
+            candidates,
+            key=lambda rank: (affinity[rank] - load[rank], -load[rank], -rank),
+        )
+
+    affinity_min = min(affinity[rank] for rank in candidates)
+    affinity_span = max(affinity[rank] for rank in candidates) - affinity_min
+    load_min = min(load[rank] for rank in candidates)
+    load_span = max(load[rank] for rank in candidates) - load_min
+
+    def score(rank: int) -> tuple[float, float, int]:
+        correlation = (
+            (affinity[rank] - affinity_min) / affinity_span if affinity_span else 0.0
+        )
+        normalized_load = (load[rank] - load_min) / load_span if load_span else 0.0
+        return (
+            correlation_weight * correlation
+            - (1 - correlation_weight) * normalized_load,
+            -load[rank],
+            -rank,
+        )
+
+    return max(candidates, key=score)
+
+
 def _node_units(
     num_experts: int, num_groups: int, num_nodes: int
 ) -> list[list[int]] | None:
@@ -34,6 +66,7 @@ def _place_units_on_nodes(
     weight: np.ndarray,
     counts: np.ndarray,
     num_nodes: int,
+    correlation_weight: float | None,
 ) -> list[list[int]]:
     """Seed nodes by load, then place each remaining unit by pair affinity."""
     unit_load = [sum(float(weight[e]) for e in unit) for unit in units]
@@ -47,21 +80,21 @@ def _place_units_on_nodes(
         node_load[node] += unit_load[unit_idx]
 
     for unit_idx in ordered[num_nodes:]:
-
-        def score(node: int) -> tuple[float, float, int]:
-            affinity = sum(
-                _pair_count(counts, expert, resident)
-                for placed_idx in node_units[node]
-                for expert in units[unit_idx]
-                for resident in units[placed_idx]
-            )
-            return (affinity - node_load[node], -node_load[node], -node)
-
         candidates = [
-            node for node in range(num_nodes)
-            if len(node_units[node]) < units_per_node
+            node for node in range(num_nodes) if len(node_units[node]) < units_per_node
         ]
-        chosen = max(candidates, key=score)
+        affinity = {
+            node: float(
+                sum(
+                    _pair_count(counts, expert, resident)
+                    for placed_idx in node_units[node]
+                    for expert in units[unit_idx]
+                    for resident in units[placed_idx]
+                )
+            )
+            for node in candidates
+        }
+        chosen = _choose_candidate(candidates, affinity, node_load, correlation_weight)
         node_units[chosen].append(unit_idx)
         node_load[chosen] += unit_load[unit_idx]
 
@@ -80,6 +113,7 @@ class CorrAwareEplbPolicy(DefaultEplbPolicy):
         counts: np.ndarray,
         num_copies: int,
         num_ranks: int,
+        correlation_weight: float | None = None,
     ) -> list[list[int]]:
         """Replicate by load and place copies using affinity and rank load."""
         local_weight = weight[experts]
@@ -108,21 +142,24 @@ class CorrAwareEplbPolicy(DefaultEplbPolicy):
 
         for expert in remaining:
             candidates = [
-                rank for rank in range(num_ranks)
-                if len(placed[rank]) < slots_per_rank
+                rank for rank in range(num_ranks) if len(placed[rank]) < slots_per_rank
             ]
             distinct = [rank for rank in candidates if expert not in placed[rank]]
             if distinct:
                 candidates = distinct
 
-            def score(rank: int) -> tuple[float, float, int]:
-                affinity = sum(
-                    _pair_count(counts, expert, resident)
-                    for resident in set(placed[rank])
+            affinity = {
+                rank: float(
+                    sum(
+                        _pair_count(counts, expert, resident)
+                        for resident in set(placed[rank])
+                    )
                 )
-                return (affinity - rank_load[rank], -rank_load[rank], -rank)
-
-            chosen = max(candidates, key=score)
+                for rank in candidates
+            }
+            chosen = _choose_candidate(
+                candidates, affinity, rank_load, correlation_weight
+            )
             placed[chosen].append(expert)
             rank_load[chosen] += copy_load[expert]
 
@@ -139,7 +176,10 @@ class CorrAwareEplbPolicy(DefaultEplbPolicy):
         old_global_expert_indices: torch.Tensor | None = None,
         *,
         expert_pair_counts: torch.Tensor | None = None,
+        correlation_weight: float | None = None,
     ) -> torch.Tensor:
+        if correlation_weight is not None and not 0 <= correlation_weight <= 1:
+            raise ValueError("correlation_weight must be between 0 and 1")
         if expert_pair_counts is None:
             return super().rebalance_experts(
                 weight,
@@ -174,7 +214,11 @@ class CorrAwareEplbPolicy(DefaultEplbPolicy):
                 layer_copies = num_replicas
             else:
                 node_experts = _place_units_on_nodes(
-                    units, weight_np[layer], counts_np[layer], num_nodes
+                    units,
+                    weight_np[layer],
+                    counts_np[layer],
+                    num_nodes,
+                    correlation_weight,
                 )
                 layer_ranks = ranks_per_node
                 layer_copies = copies_per_node
@@ -187,6 +231,7 @@ class CorrAwareEplbPolicy(DefaultEplbPolicy):
                     counts_np[layer],
                     layer_copies,
                     layer_ranks,
+                    correlation_weight,
                 )
                 for rank_experts in placed:
                     result[layer, offset : offset + len(rank_experts)] = rank_experts

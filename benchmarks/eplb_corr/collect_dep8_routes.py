@@ -14,7 +14,6 @@ import time
 from pathlib import Path
 
 import httpx
-
 from server import SERVED_MODEL, command
 
 HERE = Path(__file__).resolve().parent
@@ -67,6 +66,17 @@ def run(args: argparse.Namespace) -> None:
     _set_arg(serve_command, "--tensor-parallel-size", "1")
     _set_arg(serve_command, "--data-parallel-size", "8")
     _set_arg(serve_command, "--data-parallel-size-local", "8")
+    _set_arg(
+        serve_command, "--max-num-batched-tokens", str(args.max_num_batched_tokens)
+    )
+    _set_arg(serve_command, "--max-model-len", str(args.max_model_len))
+    if args.attention_config:
+        _set_arg(serve_command, "--attention-config", args.attention_config)
+    if args.engram_config:
+        _set_arg(serve_command, "--engram-config", args.engram_config)
+    if args.no_prefix_caching:
+        serve_command.remove("--enable-prefix-caching")
+        serve_command.append("--no-enable-prefix-caching")
     environment = os.environ.copy()
     environment.update(
         {
@@ -100,6 +110,9 @@ def run(args: argparse.Namespace) -> None:
                 "input_sha256": _sha256(args.input),
                 "requests": request_count,
                 "concurrency": args.concurrency,
+                "wave_size": args.wave_size,
+                "max_num_batched_tokens": args.max_num_batched_tokens,
+                "max_model_len": args.max_model_len,
                 "command": serve_command,
                 "source_sha256": {
                     str(path.relative_to(REPO)): _sha256(path) for path in source_files
@@ -143,6 +156,8 @@ def run(args: argparse.Namespace) -> None:
                     "0",
                     "--measure-requests",
                     str(request_count),
+                    "--wave-size",
+                    str(args.wave_size),
                     "--reset-prefix-cache",
                 ],
                 cwd=REPO,
@@ -179,6 +194,12 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--concurrency", type=int, default=64)
     parser.add_argument("--requests", type=int)
+    parser.add_argument("--wave-size", type=int, default=0)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=4096)
+    parser.add_argument("--max-model-len", type=int, default=1048576)
+    parser.add_argument("--attention-config", type=str)
+    parser.add_argument("--engram-config", type=str)
+    parser.add_argument("--no-prefix-caching", action="store_true")
     parser.add_argument("--port", type=int, default=19081)
     parser.add_argument("--timeout", type=int, default=3600)
     args = parser.parse_args()

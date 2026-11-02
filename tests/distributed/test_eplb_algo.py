@@ -25,9 +25,7 @@ def test_corr_aware_without_pair_counts_uses_default_placement():
     weight = torch.tensor([[10, 9, 2, 1]])
     old_placement = torch.tensor([[3, 0, 2, 1]])
 
-    expected = DefaultEplbPolicy.rebalance_experts(
-        weight, 4, 1, 1, 2, old_placement
-    )
+    expected = DefaultEplbPolicy.rebalance_experts(weight, 4, 1, 1, 2, old_placement)
     actual = CorrAwareEplbPolicy.rebalance_experts(
         weight, 4, 1, 1, 2, old_placement, expert_pair_counts=None
     )
@@ -46,6 +44,23 @@ def test_corr_aware_places_correlated_experts_together():
     )
 
     assert torch.equal(placement, torch.tensor([[0, 3, 1, 2]]))
+
+
+def test_corr_aware_weight_sweep_changes_rank_choice():
+    weight = torch.tensor([[10, 9, 2, 1]])
+    pairs = torch.zeros((1, 4, 4), dtype=torch.int64)
+    pairs[0, 2, 0] = 100
+    pairs[0, 3, 1] = 100
+
+    load_only = CorrAwareEplbPolicy.rebalance_experts(
+        weight, 4, 1, 1, 2, expert_pair_counts=pairs, correlation_weight=0.0
+    )
+    correlation_only = CorrAwareEplbPolicy.rebalance_experts(
+        weight, 4, 1, 1, 2, expert_pair_counts=pairs, correlation_weight=1.0
+    )
+
+    assert torch.equal(load_only, torch.tensor([[0, 3, 1, 2]]))
+    assert torch.equal(correlation_only, torch.tensor([[0, 2, 1, 3]]))
 
 
 def test_corr_aware_replicates_heavy_expert_across_ranks():

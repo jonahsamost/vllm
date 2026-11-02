@@ -235,6 +235,23 @@ async def replay(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 response.raise_for_status()
             results = await replay_task
+        elif args.wave_size:
+            results = []
+            for start in range(0, len(measured_rows), args.wave_size):
+                results.extend(
+                    await _phase(
+                        client,
+                        url,
+                        args.model,
+                        measured_rows[start : start + args.wave_size],
+                        args.concurrency,
+                    )
+                )
+                print(
+                    f"Completed request wave {start // args.wave_size + 1} "
+                    f"of {math.ceil(len(measured_rows) / args.wave_size)}",
+                    flush=True,
+                )
         else:
             results = await _phase(
                 client,
@@ -258,6 +275,7 @@ async def replay(args: argparse.Namespace) -> dict[str, Any]:
         "profile": args.profile,
         "profile_seconds": args.profile_seconds if args.profile else None,
         "reset_prefix_cache": args.reset_prefix_cache,
+        "wave_size": args.wave_size,
         "warmup": warmup_summary,
         "measured": _summary(results),
     }
@@ -281,6 +299,7 @@ def main() -> None:
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-seconds", type=float, default=10)
     parser.add_argument("--reset-prefix-cache", action="store_true")
+    parser.add_argument("--wave-size", type=int, default=0)
     args = parser.parse_args()
     if (
         args.concurrency < 1
@@ -288,6 +307,7 @@ def main() -> None:
         or args.warmup_requests < 0
         or args.measure_requests < 1
         or args.profile_seconds <= 0
+        or args.wave_size < 0
     ):
         parser.error("Concurrency and request counts must be positive")
     summary = asyncio.run(replay(args))
