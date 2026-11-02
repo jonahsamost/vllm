@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 610">
+<rect width="100%" height="100%" fill="white"/>
+<g font-family="Arial, sans-serif" fill="#263340">
+<text x="95" y="35" font-size="23" font-weight="bold">Throughput vs mean time per output token</text>
+<line x1="95" y1="515.0" x2="835" y2="515.0" stroke="#e7edf2"/>
+<text x="83" y="520.0" text-anchor="end" font-size="13">0</text>
+<line x1="95.0" y1="75" x2="95.0" y2="515" stroke="#edf1f4"/>
+<text x="95.0" y="538" text-anchor="middle" font-size="13">0</text>
+<line x1="95" y1="427.0" x2="835" y2="427.0" stroke="#e7edf2"/>
+<text x="83" y="432.0" text-anchor="end" font-size="13">21</text>
+<line x1="243.0" y1="75" x2="243.0" y2="515" stroke="#edf1f4"/>
+<text x="243.0" y="538" text-anchor="middle" font-size="13">114</text>
+<line x1="95" y1="339.0" x2="835" y2="339.0" stroke="#e7edf2"/>
+<text x="83" y="344.0" text-anchor="end" font-size="13">42</text>
+<line x1="391.0" y1="75" x2="391.0" y2="515" stroke="#edf1f4"/>
+<text x="391.0" y="538" text-anchor="middle" font-size="13">228</text>
+<line x1="95" y1="251.0" x2="835" y2="251.0" stroke="#e7edf2"/>
+<text x="83" y="256.0" text-anchor="end" font-size="13">63</text>
+<line x1="539.0" y1="75" x2="539.0" y2="515" stroke="#edf1f4"/>
+<text x="539.0" y="538" text-anchor="middle" font-size="13">342</text>
+<line x1="95" y1="163.0" x2="835" y2="163.0" stroke="#e7edf2"/>
+<text x="83" y="168.0" text-anchor="end" font-size="13">84</text>
+<line x1="687.0" y1="75" x2="687.0" y2="515" stroke="#edf1f4"/>
+<text x="687.0" y="538" text-anchor="middle" font-size="13">456</text>
+<line x1="95" y1="75.0" x2="835" y2="75.0" stroke="#e7edf2"/>
+<text x="83" y="80.0" text-anchor="end" font-size="13">105</text>
+<line x1="835.0" y1="75" x2="835.0" y2="515" stroke="#edf1f4"/>
+<text x="835.0" y="538" text-anchor="middle" font-size="13">570</text>
+<line x1="95" y1="515" x2="835" y2="515" stroke="#344455" stroke-width="1.5"/>
+<line x1="95" y1="75" x2="95" y2="515" stroke="#344455" stroke-width="1.5"/>
+<text x="465.0" y="586" text-anchor="middle" font-size="16">Output tokens / second</text>
+<text transform="translate(24 295.0) rotate(-90)" text-anchor="middle" font-size="16">Mean time per output token (ms)</text>
+<polyline points="350.2,256.9 445.9,268.4 530.2,246.6 651.0,216.2 713.1,184.3 755.7,140.5" fill="none" stroke="#515e70" stroke-width="3"/>
+<circle cx="350.2" cy="256.9" r="5" fill="#515e70"/>
+<text x="358.2" y="249.9" font-size="11" fill="#515e70">c16</text>
+<circle cx="445.9" cy="268.4" r="5" fill="#515e70"/>
+<text x="453.9" y="261.4" font-size="11" fill="#515e70">c24</text>
+<circle cx="530.2" cy="246.6" r="5" fill="#515e70"/>
+<text x="538.2" y="239.6" font-size="11" fill="#515e70">c32</text>
+<circle cx="651.0" cy="216.2" r="5" fill="#515e70"/>
+<text x="659.0" y="209.2" font-size="11" fill="#515e70">c48</text>
+<circle cx="713.1" cy="184.3" r="5" fill="#515e70"/>
+<text x="721.1" y="177.3" font-size="11" fill="#515e70">c64</text>
+<circle cx="755.7" cy="140.5" r="5" fill="#515e70"/>
+<text x="763.7" y="133.5" font-size="11" fill="#515e70">c96</text>
+<line x1="95" y1="545" x2="120" y2="545" stroke="#515e70" stroke-width="3"/>
+<text x="129" y="550" font-size="13">No EPLB</text>
+<polyline points="342.7,280.2 428.1,254.7 517.1,243.0 639.1,208.7 688.9,180.5 725.0,148.2" fill="none" stroke="#1388a8" stroke-width="3"/>
+<circle cx="342.7" cy="280.2" r="5" fill="#1388a8"/>
+<text x="350.7" y="273.2" font-size="11" fill="#1388a8">c16</text>
+<circle cx="428.1" cy="254.7" r="5" fill="#1388a8"/>
+<text x="436.1" y="247.7" font-size="11" fill="#1388a8">c24</text>
+<circle cx="517.1" cy="243.0" r="5" fill="#1388a8"/>
+<text x="525.1" y="236.0" font-size="11" fill="#1388a8">c32</text>
+<circle cx="639.1" cy="208.7" r="5" fill="#1388a8"/>
+<text x="647.1" y="201.7" font-size="11" fill="#1388a8">c48</text>
+<circle cx="688.9" cy="180.5" r="5" fill="#1388a8"/>
+<text x="696.9" y="173.5" font-size="11" fill="#1388a8">c64</text>
+<circle cx="725.0" cy="148.2" r="5" fill="#1388a8"/>
+<text x="733.0" y="141.2" font-size="11" fill="#1388a8">c96</text>
+<line x1="335" y1="545" x2="360" y2="545" stroke="#1388a8" stroke-width="3"/>
+<text x="369" y="550" font-size="13">Default EPLB</text>
+<polyline points="349.2,273.8 423.9,255.3 513.0,235.7 627.4,199.5 679.7,170.6 731.9,132.4" fill="none" stroke="#d65e35" stroke-width="3"/>
+<circle cx="349.2" cy="273.8" r="5" fill="#d65e35"/>
+<text x="357.2" y="266.8" font-size="11" fill="#d65e35">c16</text>
+<circle cx="423.9" cy="255.3" r="5" fill="#d65e35"/>
+<text x="431.9" y="248.3" font-size="11" fill="#d65e35">c24</text>
+<circle cx="513.0" cy="235.7" r="5" fill="#d65e35"/>
+<text x="521.0" y="228.7" font-size="11" fill="#d65e35">c32</text>
+<circle cx="627.4" cy="199.5" r="5" fill="#d65e35"/>
+<text x="635.4" y="192.5" font-size="11" fill="#d65e35">c48</text>
+<circle cx="679.7" cy="170.6" r="5" fill="#d65e35"/>
+<text x="687.7" y="163.6" font-size="11" fill="#d65e35">c64</text>
+<circle cx="731.9" cy="132.4" r="5" fill="#d65e35"/>
+<text x="739.9" y="125.4" font-size="11" fill="#d65e35">c96</text>
+<line x1="575" y1="545" x2="600" y2="545" stroke="#d65e35" stroke-width="3"/>
+<text x="609" y="550" font-size="13">Correlation-aware EPLB</text>
+</g>
+</svg>

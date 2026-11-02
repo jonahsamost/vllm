@@ -45,6 +45,10 @@ from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.model_executor.layers.fused_moe.routed_experts_trace import (
+    RoutedExpertsTraceWriter,
+    maybe_create_routed_experts_trace,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -367,6 +371,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.eplb = EPLBController(self.parallel_config, self.device)
         # The AuxOutput Connector owns R3 capture, copying, and storage.
         self.aux_output_connector: AuxOutputWorkerConnector | None = None
+        self.routed_experts_trace: RoutedExpertsTraceWriter | None = None
 
         set_offloader(create_offloader(self.vllm_config.offload_config))
 
@@ -1044,6 +1049,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self, randomize_inputs: bool = False) -> None:
+        if self.routed_experts_trace is None:
+            self.routed_experts_trace = maybe_create_routed_experts_trace(
+                self.model, self.vllm_config
+            )
         if self.vllm_config.aux_output_config.enabled:
             self.aux_output_connector = get_aux_output_connector(
                 self.model, self.vllm_config
@@ -2128,6 +2137,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
+        if self.routed_experts_trace is not None and not is_profile:
+            num_real_tokens = 0 if dummy_run else input_batch.num_tokens
+            num_reqs = 0 if dummy_run else len(input_batch.req_ids)
+            self.routed_experts_trace.record(
+                num_real_tokens,
+                has_forward=True,
+                request_ids=[] if dummy_run else list(input_batch.req_ids),
+                query_start_loc=(
+                    []
+                    if dummy_run
+                    else input_batch.query_start_loc_np[: num_reqs + 1].tolist()
+                ),
+            )
+
         self.kv_connector.finish_forward()
 
         if self.is_last_pp_rank:
@@ -2443,6 +2466,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             BreakableCUDAGraphWrapper.clear_all_graphs()
         if self.aux_output_connector is not None:
             self.aux_output_connector.close()
+        if self.routed_experts_trace is not None:
+            self.routed_experts_trace.close()
         set_offloader(None)
         self.cudagraph_manager = None
         self.fast_prefill = None
