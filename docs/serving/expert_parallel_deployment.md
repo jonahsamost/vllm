@@ -150,12 +150,14 @@ Configure EPLB with the `--eplb-config` argument, which accepts a JSON string. T
 
 | Parameter | Description | Default |
 | --------- | ----------- | ------- |
-| `window_size` | Number of engine steps to track for rebalancing decisions; for `corr_aware`, cannot exceed `step_interval` | 1000 |
+| `window_size` | Number of engine steps to track for rebalancing decisions; for `corr_aware` and `spectral_swap`, cannot exceed `step_interval` | 1000 |
 | `step_interval` | Frequency of rebalancing (every N engine steps) | 3000 |
 | `log_balancedness` | Log balancedness metrics (avg tokens per expert ÷ max tokens per expert) | `false` |
-| `num_redundant_experts` | Additional global experts per EP rank beyond equal distribution | `0` |
+| `num_redundant_experts` | Additional physical expert copies across the EP group | `0` |
 | `use_async` | Run placement planning and expert migration in the background | `true` |
-| `policy` | Expert placement policy: `"default"` or `"corr_aware"` | `"default"` |
+| `policy` | Expert placement policy: `"default"`, `"corr_aware"`, or `"spectral_swap"` | `"default"` |
+| `spectral_swap_alpha` | Correlation weight for spectral-swap placement, from 0 (load balance) to 1 (co-routing) | 0.5 |
+| `spectral_swap_assignment_load_weight` | Nonnegative load weight for spectral assignment; when set, plans replica counts before clustering and skips expert swaps | `null` |
 | `communicator` | Backend for expert weight transfers: `"torch_nccl"`, `"torch_gloo"`, `"pynccl"`, `"nixl"`,  or `null` (auto) | `null` |
 
 With `policy="corr_aware"`, `window_size` must not exceed `step_interval`. When
@@ -164,6 +166,20 @@ correlation-aware EPLB discards that sampling window and starts a new one.
 The policy uses token co-selection counts to place correlated experts on the
 same node and GPU, while using expert load to choose replica counts and seed
 placement. It plans asynchronously when `use_async=true`.
+
+The `spectral_swap` policy uses the same windowed expert loads and co-selection
+counts. It first clusters experts by co-routing, then swaps experts across ranks
+to improve a weighted score for co-routing and load balance. It currently
+requires one node and `num_redundant_experts` equal to the EP rank count (eight
+extra copies for eight ranks). `spectral_swap_alpha` controls the swap score;
+the policy also supports asynchronous planning.
+
+Setting `spectral_swap_assignment_load_weight` selects an experimental faster
+path. It chooses replica counts from expert load, uses expected per-copy load
+when assigning experts to spectral clusters, and places the extra copies after
+clustering. The new path does not run the swap pass. `spectral_swap_alpha` still
+controls how the extra copies are placed among eligible ranks. Leaving the
+new setting unset preserves the original spectral-swap behavior.
 
 For example:
 

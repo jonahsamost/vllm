@@ -238,13 +238,15 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
                 dtype=torch.int32,
                 device=z.device,
             )
+        einsum_kwargs = {"recipe": self._einsum_recipe}
+        if quantize:
+            einsum_kwargs["use_128x4_sfd_layout"] = True
         fp8_einsum(
             "bhr,hdr->bhd",
             (attn_out.data[:, :groups], attn_out.scale[:, :groups]),
             (self.wo_a.weight, self.wo_a.weight_scale),
             (z, z_scale) if quantize else z,
-            recipe=self._einsum_recipe,
-            use_128x4_sfd_layout=quantize,
+            **einsum_kwargs,
         )
         z = z.flatten(1)
         if not quantize:

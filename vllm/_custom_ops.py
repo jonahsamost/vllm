@@ -2244,7 +2244,7 @@ def moe_align_block_size(
             expert_map,
         )
         return
-    torch.ops._moe_C.moe_align_block_size(
+    args = (
         topk_ids,
         num_experts,
         block_size,
@@ -2252,8 +2252,11 @@ def moe_align_block_size(
         experts_ids,
         num_tokens_post_pad,
         expert_map,
-        scatter_idx,
     )
+    if scatter_idx is None:
+        torch.ops._moe_C.moe_align_block_size(*args)
+    else:
+        torch.ops._moe_C.moe_align_block_size(*args, scatter_idx)
 
 
 def fused_globalize_align_block_size(

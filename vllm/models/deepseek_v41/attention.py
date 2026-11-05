@@ -572,7 +572,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # FlashMLA reads the interleaved V4.1 records as rows of the whole
             # cache, so the packed block has to hold whole rows of both.
             packed_block_stride_alignment=(
-                math.lcm(self.swa_bytes_per_token, self.compressed_bytes_per_token)
+                math.lcm(
+                    self.swa_bytes_per_token,
+                    self.compressed_bytes_per_token,
+                    512,
+                )
                 if self.kv_mxfp8
                 else None
             ),

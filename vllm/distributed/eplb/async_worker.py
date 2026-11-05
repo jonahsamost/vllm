@@ -54,7 +54,6 @@ def run_rebalance_experts(
 ) -> torch.Tensor:
     assert model_state.eplb_stats is not None
     eplb_stats = model_state.eplb_stats
-
     # Move the global statistics to CPU for policy computation.
     with device_stream(stream):
         global_expert_load_window = eplb_stats.global_expert_load_window.cpu()
@@ -72,9 +71,9 @@ def run_rebalance_experts(
         eplb_stats.num_gpus,
         physical_to_logical_map_cpu,
         expert_pair_counts=expert_pair_counts,
+        **eplb_state._policy_kwargs(),
     )
     assert new_physical_to_logical_map.device == torch.device("cpu")
-
     return new_physical_to_logical_map
 
 
@@ -96,7 +95,6 @@ def transfer_run_periodically(
             # Set the async worker's CUDA stream on the communicator
             model_state.communicator.set_stream(stream)
             num_layers = model_state.model.num_moe_layers
-
             # Snapshot the physical_to_logical_map (synchronized with
             # rearrange_event) and copy it to CPU
             with device_stream(stream):
@@ -167,7 +165,6 @@ def transfer_run_periodically(
                         else None
                     ),
                 )
-
                 # Wait until all writes to expert_buffer have finished before making the
                 # AsyncEplbLayerResult visible to the main thread.
                 stream.synchronize()

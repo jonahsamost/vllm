@@ -37,7 +37,7 @@ _NUMACTL_CPUSET_PATTERN = re.compile(r"^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
-EPLBPolicyOption = Literal["default", "corr_aware"]
+EPLBPolicyOption = Literal["default", "corr_aware", "spectral_swap"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 EPLBCommunicatorBackend = Literal[
     "torch_nccl", "torch_gloo", "torch_xccl", "nixl", "pynccl"
@@ -65,8 +65,8 @@ class EPLBConfig:
     """Configuration for Expert Parallel Load Balancing (EP)."""
 
     window_size: int = Field(default=1000, gt=0)
-    """Window size for expert load recording. With ``corr_aware``, this must
-    not exceed ``step_interval``.
+    """Window size for expert load recording. With ``corr_aware`` or
+    ``spectral_swap``, this must not exceed ``step_interval``.
     """
     step_interval: int = Field(default=3000, gt=0)
     """
@@ -96,6 +96,12 @@ class EPLBConfig:
     policy: EPLBPolicyOption = "default"
     """The policy type for expert parallel load balancing (EPLB)."""
 
+    spectral_swap_alpha: float = Field(default=0.5, ge=0.0, le=1.0)
+    """Correlation weight used when the spectral-swap policy refines placement."""
+
+    spectral_swap_assignment_load_weight: float | None = Field(default=None, ge=0.0)
+    """Use load-aware spectral assignment with this weight and skip swaps."""
+
     communicator: EPLBCommunicatorBackend | None = None
     """
     Backend for EPLB expert weight communication:
@@ -121,14 +127,27 @@ class EPLBConfig:
 
     @model_validator(mode="after")
     def _validate_eplb_config(self) -> Self:
-        if self.policy == "corr_aware" and self.window_size > self.step_interval:
+        if (
+            self.spectral_swap_assignment_load_weight is not None
+            and self.policy != "spectral_swap"
+        ):
             raise ValueError(
-                "Correlation-aware EPLB requires window_size <= step_interval."
+                "spectral_swap_assignment_load_weight requires policy='spectral_swap'."
             )
-        if self.use_async and self.policy not in ("default", "corr_aware"):
+        if self.policy in ("corr_aware", "spectral_swap") and (
+            self.window_size > self.step_interval
+        ):
             raise ValueError(
-                "Async EPLB is only supported with the default and "
-                "correlation-aware policies."
+                "Pair-recording EPLB requires window_size <= step_interval."
+            )
+        if self.use_async and self.policy not in (
+            "default",
+            "corr_aware",
+            "spectral_swap",
+        ):
+            raise ValueError(
+                "Async EPLB is only supported with the default, "
+                "correlation-aware, and spectral-swap policies."
             )
         if self.use_async and self.communicator in ("torch_nccl", "pynccl"):
             raise ValueError(
@@ -611,6 +630,17 @@ class ParallelConfig:
                     f"PCP={self.prefill_context_parallel_size}, "
                     f"DP={self.data_parallel_size}."
                 )
+            if self.eplb_config.policy == "spectral_swap":
+                ep_size = (
+                    self.tensor_parallel_size
+                    * self.prefill_context_parallel_size
+                    * self.data_parallel_size
+                )
+                if self.eplb_config.num_redundant_experts != ep_size:
+                    raise ValueError(
+                        "Spectral-swap EPLB requires one redundant expert "
+                        f"per EP rank ({ep_size} copies)."
+                    )
         else:
             if self.eplb_config.num_redundant_experts != 0:
                 raise ValueError(

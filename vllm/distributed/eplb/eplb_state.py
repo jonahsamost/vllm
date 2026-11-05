@@ -491,7 +491,7 @@ class EplbState:
         self.policy = EPLB_POLICIES[policy_type]
         logger.debug("Selected EPLB policy: %s", policy_type)
 
-        if policy_type == "corr_aware":
+        if policy_type in ("corr_aware", "spectral_swap"):
             expert_token_buffer = torch.zeros(
                 (
                     model.num_moe_layers,
@@ -659,7 +659,6 @@ class EplbState:
                     ).tolist()
                 avg_tokens, max_tokens = tokens_tensors
                 balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
-
                 if ep_group.rank() == 0:
                     logger.info(
                         "EPLB step: %d for model %s: avg_tokens=%.2f, "
@@ -714,7 +713,10 @@ class EplbState:
                 eplb_model_state.rebalanced
                 for eplb_model_state in self.model_states.values()
             ):
-                if self.parallel_config.eplb_config.policy == "corr_aware":
+                if self.parallel_config.eplb_config.policy in (
+                    "corr_aware",
+                    "spectral_swap",
+                ):
                     # The previous transfer is still active. Discard this window
                     # so pair counts and load counts cover the same future steps.
                     self.expert_rearrangement_step = 0
@@ -763,6 +765,18 @@ class EplbState:
             )
         if self.should_record_pairs_tensor is not None:
             self.should_record_pairs_tensor.fill_(self._should_record_current_step())
+
+    def _policy_kwargs(self) -> dict[str, float | int]:
+        if self.parallel_config.eplb_config.policy == "spectral_swap":
+            config = self.parallel_config.eplb_config
+            kwargs: dict[str, float | int] = {"alpha": config.spectral_swap_alpha}
+            if config.spectral_swap_assignment_load_weight is not None:
+                kwargs["assignment_load_weight"] = (
+                    config.spectral_swap_assignment_load_weight
+                )
+                kwargs["max_swaps"] = 0
+            return kwargs
+        return {}
 
     def _propagate_shared_tensors(
         self,
@@ -877,7 +891,6 @@ class EplbState:
             global_expert_load_windows.append(global_expert_load_window)
         # Perform all-reduce to get the expert load across all ranks for each model
         global_expert_load_windows = self._allreduce_list(global_expert_load_windows)
-
         global_expert_pair_counts: list[torch.Tensor | None] = []
         for model_state in self.model_states.values():
             pair_counts = None
@@ -889,7 +902,6 @@ class EplbState:
                 if pair_counts is not None:
                     all_reduce(pair_counts, group=ep_group)
             global_expert_pair_counts.append(pair_counts)
-
         # TODO(bowen): Treat differently for prefill and decode nodes
         eplb_model_state = next(iter(self.model_states.values()))
         model = eplb_model_state.model
@@ -927,7 +939,8 @@ class EplbState:
             global_expert_pair_counts,
         ):
             if (
-                self.parallel_config.eplb_config.policy == "corr_aware"
+                self.parallel_config.eplb_config.policy
+                in ("corr_aware", "spectral_swap")
                 and not is_profile
                 and not use_last_expert_load
                 and pair_counts is None
@@ -949,6 +962,7 @@ class EplbState:
                         expert_pair_counts=(
                             pair_counts.cpu() if pair_counts is not None else None
                         ),
+                        **self._policy_kwargs(),
                     )
 
                 skip_rearrange = False
@@ -1521,13 +1535,11 @@ def _move_to_workspace(
         new_indices=result.new_physical_to_logical_map.numpy(),
         ep_rank=ep_rank,
     )
-
     _commit_eplb_maps_for_layer(
         model_state,
         new_physical_to_logical_map=result.new_physical_to_logical_map,
         layer=result.layer_idx,
     )
-
     if result.layer_idx == model_state.model.num_moe_layers - 1:
         model_state.rebalanced = False
 

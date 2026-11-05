@@ -461,6 +461,11 @@ def flash_attn_varlen_func(
             and torch.cuda.get_device_capability()[0] == 9
         )
 
+        gather_kv_kwargs = (
+            {"gather_kv_valid_length": gather_kv_valid_length}
+            if gather_kv_valid_length is not None
+            else {}
+        )
         out, softmax_lse, _, _ = _flash_attn_fwd(
             q,
             k,
@@ -473,7 +478,7 @@ def flash_attn_varlen_func(
             max_seqlen_k=max_seqlen_k,
             page_table=block_table,
             gather_kv_indices=gather_kv_indices,
-            gather_kv_valid_length=gather_kv_valid_length,
+            **gather_kv_kwargs,
             softmax_scale=softmax_scale,
             causal=causal,
             dynamic_causal=dynamic_causal,

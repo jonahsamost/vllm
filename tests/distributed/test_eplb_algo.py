@@ -12,12 +12,203 @@ from vllm.distributed.eplb.eplb_state import (
 )
 from vllm.distributed.eplb.policy.corr_aware import CorrAwareEplbPolicy
 from vllm.distributed.eplb.policy.default import DefaultEplbPolicy
+from vllm.distributed.eplb.policy.graph_seed import spectral_kmeans_seed
+from vllm.distributed.eplb.policy.spectral_swap import (
+    SpectralSwapEplbPolicy,
+    _greedy_legal_assignment,
+    _normalization_scales,
+    _plan_replicas,
+    improve_spectral_by_swapping,
+    place_spectral_replicas,
+)
 from vllm.platforms import current_platform
 
 
 def test_corr_aware_accepts_async_eplb():
     config = EPLBConfig(policy="corr_aware", use_async=True)
     assert config.use_async
+
+
+def test_spectral_load_assignment_config_requires_spectral_policy():
+    config = EPLBConfig(
+        policy="spectral_swap",
+        num_redundant_experts=1,
+        spectral_swap_assignment_load_weight=64.0,
+        use_async=True,
+    )
+    assert config.spectral_swap_assignment_load_weight == 64.0
+    with pytest.raises(ValueError, match="requires policy='spectral_swap'"):
+        EPLBConfig(spectral_swap_assignment_load_weight=64.0)
+
+
+def test_spectral_swap_profile_falls_back_to_default():
+    """Profiling has no pair-count sample, so it must still yield a legal map."""
+    config = EPLBConfig(policy="spectral_swap", num_redundant_experts=1, use_async=True)
+    weight = torch.tensor([[10, 9, 2, 1]])
+
+    actual = SpectralSwapEplbPolicy.rebalance_experts(weight, 6, 1, 1, 2)
+    empty_sample = SpectralSwapEplbPolicy.rebalance_experts(
+        weight, 6, 1, 1, 2, expert_pair_counts=torch.zeros((1, 4, 4))
+    )
+    expected = DefaultEplbPolicy.rebalance_experts(weight, 6, 1, 1, 2)
+
+    assert config.use_async
+    assert torch.equal(actual, expected)
+    assert torch.equal(empty_sample, expected)
+
+
+def test_spectral_swap_uses_default_for_a_layer_without_pairs():
+    weight = torch.tensor([[10, 9, 2, 1], [1, 2, 9, 10]])
+    pairs = torch.zeros((2, 4, 4), dtype=torch.int64)
+    pairs[0, 1, 0] = 5
+
+    actual = SpectralSwapEplbPolicy.rebalance_experts(
+        weight, 6, 1, 1, 2, expert_pair_counts=pairs, max_swaps=0
+    )
+    expected = DefaultEplbPolicy.rebalance_experts(weight, 6, 1, 1, 2)
+
+    assert torch.equal(actual[1], expected[1])
+
+
+def test_spectral_swap_load_endpoint_reduces_rank_concentration():
+    """The load-only endpoint should spread hot experts without losing copies."""
+    initial = np.array([0, 1, 2, 3, 4, 5], dtype=np.int32)
+    loads = np.array([100, 90, 80, 10, 10, 10], dtype=np.int64)
+    pairs = np.zeros((6, 6), dtype=np.int64)
+    pairs[1, 0] = 60
+    pairs[2, 0] = 60
+    pairs[2, 1] = 60
+
+    balanced = improve_spectral_by_swapping(initial, loads, pairs, 2, 0.0, 10)
+    initial_rank_loads = loads[initial.reshape(2, 3)].sum(axis=1)
+    balanced_rank_loads = loads[balanced.reshape(2, 3)].sum(axis=1)
+
+    assert np.array_equal(np.sort(balanced), np.sort(initial))
+    assert np.sum(balanced_rank_loads**2) < np.sum(initial_rank_loads**2)
+
+
+def test_spectral_swap_single_rank_has_no_swap_candidates():
+    initial = np.array([0, 1, 2, 3], dtype=np.int32)
+    loads = np.array([4, 3, 2, 1], dtype=np.float32)
+    pairs = np.zeros((4, 4), dtype=np.int64)
+
+    actual = improve_spectral_by_swapping(initial, loads, pairs, 1, 0.25, 10)
+
+    assert np.array_equal(actual, initial)
+
+
+@pytest.mark.parametrize("num_ranks", [2, 4, 8])
+def test_compiled_spectral_restarts_match_python_path(num_ranks):
+    num_experts = num_ranks * 4
+    rng = np.random.default_rng(num_ranks)
+    initial = np.arange(num_experts, dtype=np.int64)
+    loads = rng.integers(1, 100, size=num_experts).astype(np.float32)
+    pairs = np.tril(rng.integers(0, 100, size=(num_experts, num_experts)), k=-1)
+    kwargs = dict(similarity="raw", restarts=4, seed=19, load_penalty=0.0)
+
+    compiled = spectral_kmeans_seed(initial, loads, pairs, num_ranks, **kwargs)
+    # Every expert has one copy, so replica adjustment divides every edge by 1.
+    reference = spectral_kmeans_seed(
+        initial, loads, pairs, num_ranks, replica_adjustment=True, **kwargs
+    )
+
+    assert np.array_equal(compiled, reference)
+
+
+def test_spectral_replica_placement_avoids_hot_experts_on_same_rank():
+    """Hot experts can share a seed rank, but their replicas need other ranks."""
+    base = np.arange(16, dtype=np.int64)
+    loads = np.array([100, 90, 80, 70] + [1] * 12, dtype=np.float64)
+    pairs = np.zeros((16, 16), dtype=np.int64)
+
+    placement, _ = place_spectral_replicas(base, loads, pairs, 4, 0.25)
+
+    assert placement.shape == (20,)
+    counts = np.bincount(placement, minlength=16)
+    assert counts.sum() == 20
+    assert np.all(counts >= 1)
+    assert all(len(np.unique(row)) == 5 for row in placement.reshape(4, 5))
+
+
+def test_greedy_replica_assignment_backtracks_to_avoid_duplicate_rank():
+    valid = np.array([[True, True], [True, False]])
+    scores = np.array([[10.0, 1.0], [5.0, -np.inf]])
+
+    assert _greedy_legal_assignment(valid, scores) == (1, 0)
+
+
+def test_planned_replicas_can_repeat_a_hot_expert_on_distinct_ranks():
+    base = np.array([0, 2, 3, 4, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+    loads = np.array([1000, 100] + [1] * 14, dtype=np.float64)
+    extras, copies = _plan_replicas(loads, 4)
+    placement, _ = place_spectral_replicas(
+        base, loads, np.zeros((16, 16), dtype=np.int64), 4, 0.25, extras
+    )
+
+    assert extras == [0, 0, 0, 1]
+    assert np.array_equal(np.bincount(placement, minlength=16), copies)
+    assert all(len(np.unique(row)) == 5 for row in placement.reshape(4, 5))
+
+
+def test_spectral_normalization_preserves_copy_aware_pair_weights():
+    placement = np.array([0, 1, 2, 3, 0, 2])
+    loads = np.array([5.0, 4.0, 3.0, 2.0])
+    pairs = np.zeros((4, 4), dtype=np.int64)
+    pairs[1, 0] = 6
+    pairs[2, 0] = 10
+    pairs[2, 1] = 4
+
+    assert _normalization_scales(placement, loads, pairs, 2) == (15.0, 31.5)
+
+
+@pytest.mark.parametrize("extra_copies", [0, 2])
+def test_spectral_swap_policy_keeps_replicas_on_distinct_ranks(extra_copies):
+    """The policy must support either a pure partition or legal replicas."""
+    weight = torch.tensor([[100, 90, 80, 70, 10, 9, 8, 7]])
+    pairs = torch.zeros((1, 8, 8), dtype=torch.int64)
+    pairs[0, 1, 0] = 30
+    pairs[0, 3, 2] = 25
+
+    placement = SpectralSwapEplbPolicy.rebalance_experts(
+        weight,
+        8 + extra_copies,
+        1,
+        1,
+        2,
+        expert_pair_counts=pairs,
+        alpha=0.25,
+        max_swaps=8,
+        spectral_restarts=2,
+    ).numpy()
+
+    assert placement.shape == (1, 8 + extra_copies)
+    assert np.all(np.bincount(placement[0], minlength=8) >= 1)
+    assert all(len(np.unique(row)) == len(row) for row in placement[0].reshape(2, -1))
+
+
+def test_spectral_load_assignment_uses_planned_copies_on_distinct_ranks():
+    weight = torch.tensor([[40, 30, 20, 10, 8, 7, 6, 5]])
+    pairs = torch.zeros((1, 8, 8), dtype=torch.int64)
+    pairs[0, 2, 0] = 50
+    pairs[0, 3, 1] = 50
+    pairs[0, 4, 0] = 20
+    pairs[0, 5, 1] = 20
+
+    placement = SpectralSwapEplbPolicy.rebalance_experts(
+        weight,
+        10,
+        1,
+        1,
+        2,
+        expert_pair_counts=pairs,
+        alpha=0.25,
+        max_swaps=0,
+        spectral_restarts=4,
+        assignment_load_weight=0.5,
+    ).numpy()[0]
+
+    assert np.array_equal(np.bincount(placement, minlength=8), [2, 2, 1, 1, 1, 1, 1, 1])
+    assert all(len(np.unique(row)) == 5 for row in placement.reshape(2, 5))
 
 
 def test_corr_aware_without_pair_counts_uses_default_placement():
